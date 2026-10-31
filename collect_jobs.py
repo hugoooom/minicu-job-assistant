@@ -1,4 +1,4 @@
-"""自动采集当前搜索结果首屏岗位和详情；首次登录由使用者完成。"""
+"""自动采集搜索列表与详情；先确认登录，按需滚动加载。"""
 
 import argparse
 import base64
@@ -12,6 +12,7 @@ from urllib.request import ProxyHandler, build_opener
 
 import websocket
 from rapidocr import RapidOCR
+from salary import normalize_salary
 
 from extract_first_job import CardParser, needs_ocr
 from inspect_cdp import OUTPUT, PORT, PROFILE, build_command, ensure_port_free, find_edge, wait_for_cdp
@@ -23,6 +24,10 @@ CITY_CODES = {"广州": "101280100", "深圳": "101280600"}
 
 
 class AccessGate(RuntimeError):
+    pass
+
+
+class LoginRequired(AccessGate):
     pass
 
 
@@ -139,7 +144,10 @@ def snapshot(cdp):
 
 
 def check_gate(text):
-    for marker in ("登录查看完整内容", "请完成安全验证", "您的环境存在异常", "访问过于频繁"):
+    for marker in ("登录查看完整内容", "请登录后查看", "登录后查看完整"):
+        if marker in text:
+            raise LoginRequired(f"需要登录：{marker}")
+    for marker in ("请完成安全验证", "您的环境存在异常", "访问过于频繁"):
         if marker in text:
             raise AccessGate(f"页面要求处理：{marker}；已停止本轮采集。")
 
@@ -148,6 +156,52 @@ def navigate(cdp, url):
     result = cdp.call("Page.navigate", {"url": url})
     if result.get("errorText"):
         raise RuntimeError(f"页面导航失败：{result['errorText']}")
+
+
+def authentication_state(cdp, root=None, page_text=None):
+    root = root or document(cdp)
+    text = rendered_text(snapshot(cdp)) if page_text is None else page_text
+    try:
+        check_gate(text)
+    except LoginRequired:
+        return "logged_out"
+    # 游客也有职位列表。必须出现可见的账户入口和退出登录节点才确认登录。
+    account = query(cdp, root["nodeId"], ".user-nav .nav-figure")
+    if account and query(cdp, account, "a.link-logout"):
+        try:
+            box = cdp.call("DOM.getBoxModel", {"nodeId": account})["model"]
+            if box["width"] > 0 and box["height"] > 0:
+                return "authenticated"
+        except RuntimeError:
+            pass
+    return "unconfirmed"
+
+
+def wait_authenticated(cdp, timeout):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            if authentication_state(cdp) == "authenticated":
+                return True
+        except AccessGate:
+            raise
+        except RuntimeError:
+            pass
+        time.sleep(0.5)
+    return False
+
+
+def require_login(cdp, return_url, no_prompt=False):
+    if wait_authenticated(cdp, 6):
+        return
+    if no_prompt:
+        raise LoginRequired("未确认已登录，--no-prompt 模式已停止，不采集游客数据。")
+    print("尚未确认登录。请在本次 Edge 任务页点击登录/注册并完成登录。", flush=True)
+    input("登录完成后回到终端按回车；程序会重新验证登录状态：")
+    navigate(cdp, return_url)
+    if not wait_authenticated(cdp, 20):
+        raise LoginRequired("仍未检测到有效登录状态，未继续采集。")
+    print("已确认登录，继续采集。", flush=True)
 
 
 def wait_cards(cdp, timeout=20):
@@ -159,7 +213,11 @@ def wait_cards(cdp, timeout=20):
                 "nodeId": root["nodeId"], "selector": "li.job-card-box"
             }).get("nodeIds", [])
             if cards:
+                if authentication_state(cdp, root) != "authenticated":
+                    raise LoginRequired("列表已出现，但当前未确认已登录。")
                 return cards
+        except AccessGate:
+            raise
         except RuntimeError:
             pass  # 导航时节点会失效，重新获取根节点。
         time.sleep(0.4)
@@ -175,14 +233,18 @@ def salary_screenshot(cdp, node_id, path):
         raise ValueError("薪资区域不可见。")
     result = cdp.call("Page.captureScreenshot", {
         "format": "png", "captureBeyondViewport": True,
-        "clip": {"x": min(xs), "y": min(ys), "width": width, "height": height, "scale": 1}
+        "clip": {"x": max(0, min(xs) - 3), "y": max(0, min(ys) - 3),
+                 "width": width + 6, "height": height + 6, "scale": 2}
     })
     path.write_bytes(base64.b64decode(result["data"]))
 
 
-def read_list(cdp, nodes, folder):
-    jobs, seen, engine = [], set(), None
+def read_list(cdp, nodes, folder, skip_ids=None, limit=None, engine_state=None, on_job=None):
+    jobs, seen = [], set(skip_ids or [])
+    engine_state = engine_state if engine_state is not None else [None]
     for index, node in enumerate(nodes, start=1):
+        if limit is not None and len(jobs) >= limit:
+            break
         parser = CardParser()
         html = outer_html(cdp, node)
         parser.feed(html)
@@ -204,19 +266,23 @@ def read_list(cdp, nodes, folder):
                     raise ValueError("缺少薪资元素。")
                 path = folder / f"{job_id}-salary.png"
                 salary_screenshot(cdp, salary_id, path)
-                if engine is None:
-                    engine = RapidOCR(params={"Global.log_level": "warning"})
-                result = engine(str(path), use_det=False, use_cls=False, use_rec=True)
+                if engine_state[0] is None:
+                    engine_state[0] = RapidOCR(params={"Global.log_level": "warning"})
+                result = engine_state[0](str(path), use_det=False, use_cls=False, use_rec=True)
                 if not result.txts or not any(text.strip() for text in result.txts):
                     raise ValueError("薪资 OCR 结果为空。")
                 job.update(salary=" ".join(result.txts), salary_source="OCR",
                            salary_ocr_scores=[float(score) for score in result.scores])
             else:
                 job.update(salary=job["salary_raw"], salary_source="DOM")
+            job.update(normalize_salary(job["salary"], job["salary_raw"]))
         except (RuntimeError, ValueError, OSError) as exc:
-            job.update(salary=None, salary_source="error", salary_error=str(exc))
+            job.update(salary=None, salary_source="error", salary_status="error",
+                       salary_unit=None, salary_period=None, salary_error=str(exc))
         job.pop("salary_raw", None)
         jobs.append(job)
+        if on_job:
+            on_job(job)
         print(f"列表 {index}/{len(nodes)}：{job['title']}，薪资 {job.get('salary')}", flush=True)
     return jobs
 
@@ -229,13 +295,17 @@ def read_description(cdp, job, folder, timeout=20):
             root = document(cdp)
             current = urlsplit(root.get("documentURL", ""))
             if current.path != urlsplit(job["url"]).path:
+                check_gate(rendered_text(snapshot(cdp)))
                 time.sleep(0.4)
                 continue
             description_id = query(cdp, root["nodeId"], ".job-detail-body .desc, .job-sec-text")
             if description_id:
                 backend = cdp.call("DOM.describeNode", {"nodeId": description_id})["node"]["backendNodeId"]
                 data = snapshot(cdp)
-                check_gate(rendered_text(data))
+                page_text = rendered_text(data)
+                check_gate(page_text)
+                if authentication_state(cdp, root, page_text) != "authenticated":
+                    raise LoginRequired("详情已出现，但未确认已登录，不能将游客预览视作完整描述。")
                 text = rendered_text(data, backend)
                 if len(text) >= 40:
                     if needs_ocr(text):
@@ -257,20 +327,90 @@ def save_jobs(path, payload):
     temporary.replace(path)
 
 
+def read_description_with_login(cdp, job, folder, no_prompt=False):
+    try:
+        return read_description(cdp, job, folder)
+    except LoginRequired:
+        require_login(cdp, job["url"], no_prompt=no_prompt)
+        return read_description(cdp, job, folder)
+
+
+def scroll_list(cdp, nodes):
+    last = nodes[-1]
+    cdp.call("DOM.scrollIntoViewIfNeeded", {"nodeId": last})
+    box = cdp.call("DOM.getBoxModel", {"nodeId": last})["model"]["border"]
+    viewport = cdp.call("Page.getLayoutMetrics")["cssVisualViewport"]
+    x = (min(box[0::2]) + max(box[0::2])) / 2 - viewport["pageX"]
+    y = (min(box[1::2]) + max(box[1::2])) / 2 - viewport["pageY"]
+    x = max(1, min(x, viewport["clientWidth"] - 1))
+    y = max(1, min(y, viewport["clientHeight"] - 1))
+    cdp.call("Input.dispatchMouseEvent", {
+        "type": "mouseWheel", "x": x, "y": y, "deltaX": 0, "deltaY": 650
+    })
+
+
+def update_report(payload):
+    jobs = payload["jobs"]
+    payload["collected_count"] = len(jobs)
+    payload["missing_count"] = max(0, payload["requested_count"] - len(jobs))
+    payload["description_success_count"] = sum(job["description_status"] == "ok" for job in jobs)
+    payload["salary_success_count"] = sum(job.get("salary_status") in ("ok", "negotiable") for job in jobs)
+    payload["fully_extracted_count"] = sum(
+        job["description_status"] == "ok" and job.get("salary_status") in ("ok", "negotiable") for job in jobs
+    )
+
+
+def collect_list(cdp, payload, folder, path, list_url, no_prompt, max_scrolls):
+    seen, engine_state, unchanged, scrolls = set(), [None], 0, 0
+
+    def save_one(job):
+        payload["jobs"].append(job)
+        seen.add(job["id"])
+        update_report(payload)
+        save_jobs(path, payload)
+
+    while len(payload["jobs"]) < payload["requested_count"]:
+        try:
+            nodes = wait_cards(cdp)
+        except LoginRequired:
+            require_login(cdp, list_url, no_prompt)
+            nodes = wait_cards(cdp)
+        before = len(payload["jobs"])
+        read_list(cdp, nodes, folder, skip_ids=seen,
+                  limit=payload["requested_count"] - before,
+                  engine_state=engine_state, on_job=save_one)
+        if len(payload["jobs"]) >= payload["requested_count"]:
+            return "requested_limit_reached"
+        unchanged = unchanged + 1 if len(payload["jobs"]) == before else 0
+        if unchanged >= 3:
+            return "no_new_results_after_scroll"
+        if scrolls >= max_scrolls:
+            return "max_scrolls_reached"
+        print(f"当前取得 {len(payload['jobs'])}/{payload['requested_count']} 条，继续加载列表……", flush=True)
+        scroll_list(cdp, nodes)
+        scrolls += 1
+        time.sleep(1)
+    return "requested_limit_reached"
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--keyword", default="Python")
     parser.add_argument("--city", choices=CITY_CODES, default="广州")
-    parser.add_argument("--limit", type=int, choices=range(1, 11), default=3, metavar="1-10")
-    parser.add_argument("--no-prompt", action="store_true", help="列表未加载时直接报错，不等待登录")
+    parser.add_argument("--limit", type=int, choices=range(1, 101), default=3, metavar="1-100")
+    parser.add_argument("--max-scrolls", type=int, default=12, help="最多滚动加载次数，默认 12")
+    parser.add_argument("--no-prompt", action="store_true", help="未确认登录时直接退出，不采集游客数据")
     args = parser.parse_args()
+    if args.max_scrolls < 0:
+        parser.error("--max-scrolls 不能小于 0")
     ensure_browser()
     folder = OUTPUT / "runs" / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     folder.mkdir(parents=True)
     path = folder / "jobs.json"
     target = open_task_tab()
     connection = websocket.create_connection(target["webSocketDebuggerUrl"], timeout=10, suppress_origin=True)
-    payload = {"keyword": args.keyword, "city": args.city, "status": "running", "jobs": []}
+    payload = {"keyword": args.keyword, "city": args.city, "status": "running",
+               "requested_count": args.limit, "jobs": []}
     try:
         cdp = RawCDP(connection)
         cdp.call("Page.enable")
@@ -279,23 +419,19 @@ def main():
         })
         print("自动打开搜索页……", flush=True)
         navigate(cdp, list_url)
-        try:
-            nodes = wait_cards(cdp)
-        except TimeoutError:
-            check_gate(rendered_text(snapshot(cdp)))
-            if args.no_prompt:
-                raise
-            input("列表未出现。请检查测试窗口；如需登录，请手动完成，完成后按回车继续：")
-            navigate(cdp, list_url)
-            nodes = wait_cards(cdp)
-        payload["jobs"] = read_list(cdp, nodes[:args.limit], folder)
+        require_login(cdp, list_url, args.no_prompt)
+        payload["list_stop_reason"] = collect_list(
+            cdp, payload, folder, path, list_url, args.no_prompt, args.max_scrolls
+        )
+        print(f"列表取得 {len(payload['jobs'])}/{args.limit} 条，停止原因：{payload['list_stop_reason']}", flush=True)
         save_jobs(path, payload)
         for index, job in enumerate(payload["jobs"], start=1):
             print(f"详情 {index}/{len(payload['jobs'])}：{job['title']}", flush=True)
             try:
-                job["description"] = read_description(cdp, job, folder)
+                job["description"] = read_description_with_login(cdp, job, folder, args.no_prompt)
                 job["description_source"] = "CDP_DOMSnapshot"
                 job["description_status"] = "ok"
+                job["description_characters"] = len(job["description"])
                 print(f"  已保存职位描述，{len(job['description'])} 字符。", flush=True)
             except AccessGate as exc:
                 job.update(description_status="blocked", description_error=str(exc))
@@ -303,15 +439,21 @@ def main():
             except (RuntimeError, ValueError, OSError, websocket.WebSocketException) as exc:
                 job.update(description_status="error", description_error=str(exc))
                 print("  本岗位详情未完成：", exc, flush=True)
+            update_report(payload)
             save_jobs(path, payload)
             if index < len(payload["jobs"]):
                 time.sleep(2)
-        successes = sum(job["description_status"] == "ok" for job in payload["jobs"])
-        payload["status"] = "complete" if successes == len(payload["jobs"]) else "partial"
+        update_report(payload)
+        payload["status"] = "complete" if payload["fully_extracted_count"] == args.limit else "partial"
     except (RuntimeError, ValueError, OSError, websocket.WebSocketException) as exc:
         payload.update(status="stopped", error=str(exc))
         print("本轮停止：", exc, flush=True)
     finally:
+        for job in payload["jobs"]:
+            if job["description_status"] == "pending":
+                job.update(description_status="not_processed",
+                           description_error=payload.get("error", "本轮尚未处理到此岗位。"))
+        update_report(payload)
         save_jobs(path, payload)
         connection.close()
         try:
@@ -319,7 +461,8 @@ def main():
         except (OSError, RuntimeError, websocket.WebSocketException):
             pass
     print("结果已保存：", path)
-    print("详情成功数：", sum(job["description_status"] == "ok" for job in payload["jobs"]))
+    print(f"请求 {args.limit} 条，列表 {payload['collected_count']} 条，"
+          f"薪资成功 {payload['salary_success_count']} 条，详情成功 {payload['description_success_count']} 条。")
     return 0 if payload["status"] == "complete" else 1
 
 

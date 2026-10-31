@@ -10,14 +10,19 @@
 
 首次登录或登录过期时可能需要在专用浏览器中手动登录；正常状态不需要选择标签页或逐步回车。加 `--no-prompt` 可在列表无法加载时直接退出，适合检查自动流程。
 
+进入列表后先验证登录，未确认登录时会提示人工登录并复核；`--no-prompt` 模式则直接停止。中途详情出现登录墙时也会提示登录，并重试同一岗位。
+
 参数：
 - `--keyword`：搜索关键词，默认 Python。
 - `--city`：广州或深圳，默认广州。
-- `--limit`：本轮最多处理 1–10 个岗位，默认 3。
+- `--limit`：本轮最多处理 1–100 个岗位，默认 3。
+- `--max-scrolls`：最多滚动加载次数，默认 12。
 
-当前只处理首次加载的搜索结果，尚未实现翻页、持续滚动或自动投递。
+会按需滚动加载并去重，连续三轮无新增或达到上限时结束，报告实际数量和缺口；尚未实现自动投递。
 
-结果按运行时间分别放在 `output/runs/时间/jobs.json`，同目录保存卡片 HTML、需要 OCR 的薪资截图和职位描述文本。`description_status` 为 `ok` 才表示本次成功取得描述；`error`、`blocked`、`pending` 均不代表成功。整体 `status` 可能是 `complete`、`partial` 或 `stopped`。
+结果按运行时间分别放在 `output/runs/时间/jobs.json`，同目录保存卡片 HTML、需要 OCR 的薪资截图和职位描述文本。`description_status` 为 `ok` 才表示本次成功取得描述；`error`、`blocked`、`not_processed` 均不代表成功。整体 `status` 可能是 `complete`、`partial` 或 `stopped`。顶层分别统计请求条数、实际条数、缺失条数、薪资成功数、描述成功数。
+
+输出不含 `salary_raw`。薪资会补回 DOM 中明确的金额单位和发薪后缀；无法确认单位时，`salary_status` 标为 `unit_unknown`。学历、经验和列表要求标签也会保留。
 
 职位描述通过 CDP 的 DOMSnapshot 读取渲染文本，过滤隐藏节点及其后代，避免把页面 HTML 中的隐藏干扰字混入正文。脚本全程不启用 Runtime，也不执行页面 JavaScript。
 

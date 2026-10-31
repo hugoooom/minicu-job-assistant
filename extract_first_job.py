@@ -7,6 +7,7 @@ from pathlib import Path, PurePosixPath
 from urllib.parse import urljoin, urlsplit
 
 from rapidocr import RapidOCR
+from salary import normalize_salary
 
 
 OUTPUT = Path(__file__).resolve().parent / "output"
@@ -15,6 +16,7 @@ FIELD_CLASSES = {
     "boss-name": "company",
     "company-location": "location",
     "job-salary": "salary_raw",
+    "tag-list": "tags",
 }
 VOID_TAGS = {"area", "base", "br", "col", "embed", "hr", "img", "input",
              "link", "meta", "param", "source", "track", "wbr"}
@@ -51,7 +53,16 @@ class CardParser(HTMLParser):
             self.parts[active].append(data)
 
     def fields(self):
-        return {name: " ".join("".join(parts).split()) for name, parts in self.parts.items()}
+        fields = {name: " ".join("".join(parts).split())
+                  for name, parts in self.parts.items() if name != "tags"}
+        fields["tags"] = [part.strip() for part in self.parts["tags"] if part.strip()]
+        fields["education"] = next((tag for tag in fields["tags"] if any(
+            word in tag for word in ("本科", "硕士", "博士", "大专", "高中", "中专", "学历")
+        )), None)
+        fields["experience"] = next((tag for tag in fields["tags"] if any(
+            word in tag for word in ("年", "经验", "应届", "在校")
+        )), None)
+        return fields
 
 
 def needs_ocr(text):
@@ -79,6 +90,8 @@ def main():
     else:
         job["salary"] = raw_salary
         job["salary_source"] = "DOM"
+
+    job.update(normalize_salary(job["salary"], raw_salary))
 
     job["url"] = urljoin("https://www.zhipin.com", parser.href)
     job["id"] = PurePosixPath(urlsplit(job["url"]).path).stem

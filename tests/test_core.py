@@ -36,7 +36,7 @@ class CoreTests(unittest.TestCase):
                     jobs = collect_jobs.read_list(Mock(), [1], Path(folder))
             engine.assert_not_called()
         self.assertNotIn("salary_raw", jobs[0])
-        self.assertEqual(jobs[0]["salary"], "150–200 元/天")
+        self.assertEqual(jobs[0]["salary"], "150-200元/天")
         self.assertEqual(jobs[0]["salary_source"], "DOM")
 
     def test_ocr_export_omits_confused_characters(self):

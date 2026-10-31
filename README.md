@@ -8,8 +8,10 @@
 
 - 独立启动或复用专用 Edge，使用单独的浏览器资料目录。
 - 按关键词和城市自动搜索，无需手动选择标签页。
-- 读取首次加载的岗位列表，按岗位 ID 去重。
+- 在采集前确认登录；游客列表出现也不会继续采集。中途登录过期会提示登录并重试当前岗位。
+- 读取列表并按需滚动加载，按岗位 ID 去重；连续无新增或达到滚动上限时报告原因。
 - 薪资为空或含 Unicode 私用区字符时，对局部截图进行单行 OCR。
+- 从 DOM 保留明确的 K、元/天、几薪等信息，补回 OCR 漏掉的单位与后缀；单位无法确认时明确标为未知。
 - 自动进入详情，核对 URL 中的岗位 ID，读取职位描述。
 - 按渲染状态过滤隐藏文本，避免 HTML 中的隐藏干扰字混入正文。
 - 逐条保存结果，记录失败原因，区分成功、部分完成和停止。
@@ -32,11 +34,18 @@ python -m venv .venv
 |---|---|
 | `--keyword` | 搜索关键词，默认 Python |
 | `--city` | 广州或深圳，默认广州 |
-| `--limit` | 首次加载列表中最多处理 1–10 个岗位，默认 3 |
-| `--no-prompt` | 列表无法加载时直接退出，不等待人工操作 |
+| `--limit` | 本轮最多处理 1–100 个岗位，默认 3 |
+| `--max-scrolls` | 最多滚动加载次数，默认 12；连续三轮无新增时提前结束 |
+| `--no-prompt` | 未确认登录时直接退出，不采集游客数据 |
 
 ```powershell
 .\.venv\Scripts\python.exe collect_jobs.py --keyword "AI 实习" --city 深圳 --limit 5
+```
+
+例如采集 20 条：
+
+```powershell
+.\.venv\Scripts\python.exe collect_jobs.py --keyword Python --city 广州 --limit 20
 ```
 
 结果保存在 `output/runs/运行时间/jobs.json`，同目录包含卡片 HTML、需要 OCR 的薪资截图及职位描述文本。
@@ -63,16 +72,21 @@ python -m venv .venv
 薪资原始混淆字符只参与内部判断，不写入岗位 JSON。
 整体 `status` 为 `complete`、`partial` 或 `stopped`。单个岗位的 `description_status` 为 `ok` 才表示本次取得描述。
 
+额外字段包括学历 `education`、经验 `experience`、原始要求标签 `tags`，以及 `salary_unit`、`salary_period`、`salary_pay_months`、`salary_status`。页面未给出或无法确认的内容为 `null`，不推断缺失事实。K 表示金额量级，不据此擅自填入月/年周期。
+
+顶层报告 `requested_count`、`collected_count`、`missing_count`、`salary_success_count`、`description_success_count` 和 `fully_extracted_count`。`complete` 要求达到请求条数，且这些岗位的薪资和描述都成功；单位未知或金额识别失败会导致 `partial`。停止时未处理的描述会明确标记 `not_processed`，不再默默保留 pending。
+
 ## 代码阅读顺序
 
 | 文件 | 用途 |
 |---|---|
 | `collect_jobs.py` | 自动采集、薪资 OCR、职位描述提取 |
 | `extract_first_job.py` | 卡片字段解析及 OCR 回退判断 |
+| `salary.py` | 薪资格式、单位和发薪后缀整理 |
 | `inspect_cdp.py` | 独立 Edge 启动和端口检查；另含 Playwright 对照实验 |
 | `inspect_raw_cdp.py` | 原生 CDP 客户端及诊断实验 |
 | `AUTO_COLLECT.md` | 使用说明 |
-| `tests/test_core.py` | 核心逻辑的离线测试 |
+| `tests/` | 核心逻辑、登录门槛、薪资完整性和滚动加载的离线测试 |
 
 自动采集路径不使用 Playwright 连接浏览器。依赖中保留 Playwright，是因为启动帮助函数目前与早期对照实验共用模块。
 
@@ -86,7 +100,7 @@ python -m venv .venv
 
 ## 当前边界
 
-- 只处理首次加载的列表，尚未实现翻页、持续滚动和自动投递。
+- 支持有限次数的滚动加载，尚未实现自动投递；加载不到请求数量会报告缺口，不保证遍历网站全部岗位。
 - OCR 结果需要核对，置信分数不等于准确率保证。
 - 职位描述至少 40 字符才接受，可能跳过真实但很短的描述；该阈值不保证内容完整。
 - 只读取当前账户正常可见的内容，遇到登录墙或明确访问限制会停止。
