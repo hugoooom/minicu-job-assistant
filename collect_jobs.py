@@ -345,9 +345,43 @@ def read_description(cdp, job, folder, timeout=20):
                 if authentication_state(cdp, root, page_text) != "authenticated":
                     raise LoginRequired("详情已出现，但未确认已登录，不能将游客预览视作完整描述。")
                 text = rendered_text(data, backend)
-                if len(text) >= 40:
+                ocr_ready = needs_ocr(text) and (
+                    bool(text) or time.monotonic() >= deadline - timeout + 2
+                )
+                if len(text) >= 40 or ocr_ready:
                     if needs_ocr(text):
-                        raise AccessGate("职位描述含私用区字符，尚不能确认正文正确，停止本轮采集。")
+                        from description_ocr import extract_description
+
+                        print("  正文含混淆字符或无法读取，改用分段多行 OCR……", flush=True)
+
+                        def guard():
+                            state = authentication_state(cdp)
+                            if state != "authenticated":
+                                raise LoginRequired("正文 OCR 期间未确认登录，等待重新登录。")
+
+                        def resolve_description_node():
+                            fresh_root = document(cdp)
+                            if urlsplit(fresh_root.get("documentURL", "")).path != urlsplit(job["url"]).path:
+                                raise ValueError("正文截图时岗位页面已变化。")
+                            fresh_node = query(cdp, fresh_root["nodeId"], ".job-detail-body .desc, .job-sec-text")
+                            if not fresh_node:
+                                raise ValueError("正文节点已消失。")
+                            return fresh_node
+
+                        try:
+                            text, metadata = extract_description(
+                                cdp, description_id, folder, job["id"], stable_screenshot_geometry,
+                                guard, resolve_description_node
+                            )
+                        except AccessGate:
+                            raise
+                        except (RuntimeError, OSError) as exc:
+                            raise ValueError(f"本岗位正文 OCR 失败：{exc}") from exc
+                        if needs_ocr(text):
+                            raise ValueError("本岗位 OCR 结果仍含混淆字符，未标为成功。")
+                        job.update(metadata)
+                    else:
+                        job["description_source"] = "CDP_DOMSnapshot"
                     (folder / f"{job['id']}-description.txt").write_text(text, encoding="utf-8")
                     return text
         except AccessGate:
@@ -467,7 +501,7 @@ def main():
             print(f"详情 {index}/{len(payload['jobs'])}：{job['title']}", flush=True)
             try:
                 job["description"] = read_description_with_login(cdp, job, folder, args.no_prompt)
-                job["description_source"] = "CDP_DOMSnapshot"
+                job.setdefault("description_source", "CDP_DOMSnapshot")
                 job["description_status"] = "ok"
                 job["description_characters"] = len(job["description"])
                 print(f"  已保存职位描述，{len(job['description'])} 字符。", flush=True)

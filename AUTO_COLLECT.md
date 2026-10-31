@@ -26,6 +26,8 @@
 
 职位描述通过 CDP 的 DOMSnapshot 读取渲染文本，过滤隐藏节点及其后代，避免把页面 HTML 中的隐藏干扰字混入正文。脚本全程不启用 Runtime，也不执行页面 JavaScript。
 
+若正文仍含私用区混淆字符，会自动截取正文区域并启用多行 OCR。长正文分段截图，重叠区按位置合并，避免因同一句话在不同段落重复出现而误删。结果中 `description_source` 为 `OCR`，`description_ocr_review_required` 为 true；同目录保存正文截图和识别明细。单条 OCR 失败会记录该岗位错误并继续其他岗位，登录墙或访问限制保持原有处理。
+
 实现阅读顺序：`main` → `read_list` → `read_description` → `rendered_text`。实际行号以当前文件为准。
 
 本版本已于 2026-10-31 在当前机器实测：广州、Python、连续 3 个岗位，均取得职位描述。这个结果只覆盖当时页面和登录状态，选择器或页面机制变化时仍需重新验证。
