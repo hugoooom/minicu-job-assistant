@@ -224,19 +224,57 @@ def wait_cards(cdp, timeout=20):
     raise TimeoutError("20 秒内未出现岗位列表；可能需要登录、处理页面提示或调整选择器。")
 
 
-def salary_screenshot(cdp, node_id, path):
-    cdp.call("DOM.scrollIntoViewIfNeeded", {"nodeId": node_id})
-    box = cdp.call("DOM.getBoxModel", {"nodeId": node_id})["model"]["border"]
+def screenshot_geometry(box, metrics, padding=8):
+    """元素四边形是视口坐标，截图 clip 使用文档坐标，需要加上页面滚动量。"""
     xs, ys = box[0::2], box[1::2]
     width, height = max(xs) - min(xs), max(ys) - min(ys)
     if width <= 0 or height <= 0:
         raise ValueError("薪资区域不可见。")
+    viewport = metrics["cssLayoutViewport"]
+    scroll_x, scroll_y = viewport["pageX"], viewport["pageY"]
+    left, top = max(0, min(xs) + scroll_x - padding), max(0, min(ys) + scroll_y - padding)
+    right, bottom = max(xs) + scroll_x + padding, max(ys) + scroll_y + padding
+    return {
+        "viewport_rect": {"x": min(xs), "y": min(ys), "width": width, "height": height},
+        "page_scroll": {"x": scroll_x, "y": scroll_y},
+        "clip": {"x": left, "y": top, "width": right - left, "height": bottom - top, "scale": 2},
+    }
+
+
+def stable_screenshot_geometry(cdp, node_id, timeout=3):
+    deadline, previous, stable = time.monotonic() + timeout, None, 0
+    while time.monotonic() < deadline:
+        before = cdp.call("Page.getLayoutMetrics")
+        box = cdp.call("DOM.getBoxModel", {"nodeId": node_id})["model"]["border"]
+        after = cdp.call("Page.getLayoutMetrics")
+        # 如果读取边界期间仍在滚动，这份边界和滚动偏移不能混用。
+        if before["cssLayoutViewport"] != after["cssLayoutViewport"]:
+            stable, previous = 0, None
+            time.sleep(0.05)
+            continue
+        geometry = screenshot_geometry(box, after)
+        signature = tuple(round(value, 2) for group in (geometry["clip"], geometry["page_scroll"])
+                          for value in group.values())
+        stable = stable + 1 if signature == previous else 1
+        if stable >= 3:
+            return geometry
+        previous = signature
+        time.sleep(0.05)
+    raise ValueError("滚动或布局仍在变化，未截取不确定区域。")
+
+
+def salary_screenshot(cdp, node_id, path):
+    cdp.call("DOM.scrollIntoViewIfNeeded", {"nodeId": node_id})
+    geometry = stable_screenshot_geometry(cdp, node_id)
     result = cdp.call("Page.captureScreenshot", {
         "format": "png", "captureBeyondViewport": True,
-        "clip": {"x": max(0, min(xs) - 3), "y": max(0, min(ys) - 3),
-                 "width": width + 6, "height": height + 6, "scale": 2}
+        "clip": geometry["clip"]
     })
     path.write_bytes(base64.b64decode(result["data"]))
+    path.with_suffix(".capture.json").write_text(
+        json.dumps(geometry, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return geometry
 
 
 def read_list(cdp, nodes, folder, skip_ids=None, limit=None, engine_state=None, on_job=None):
