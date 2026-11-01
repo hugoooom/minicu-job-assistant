@@ -13,6 +13,7 @@ from urllib.request import ProxyHandler, build_opener
 import websocket
 from rapidocr import RapidOCR
 from salary import normalize_salary
+from job_history import job_identity, load_history
 
 from extract_first_job import CardParser, needs_ocr
 from inspect_cdp import OUTPUT, PORT, PROFILE, build_command, ensure_port_free, find_edge, wait_for_cdp
@@ -277,8 +278,9 @@ def salary_screenshot(cdp, node_id, path):
     return geometry
 
 
-def read_list(cdp, nodes, folder, skip_ids=None, limit=None, engine_state=None, on_job=None):
-    jobs, seen = [], set(skip_ids or [])
+def read_list(cdp, nodes, folder, skip_keys=None, limit=None, engine_state=None, on_job=None,
+              observed_keys=None):
+    jobs, seen = [], set(skip_keys or [])
     engine_state = engine_state if engine_state is not None else [None]
     for index, node in enumerate(nodes, start=1):
         if limit is not None and len(jobs) >= limit:
@@ -292,10 +294,14 @@ def read_list(cdp, nodes, folder, skip_ids=None, limit=None, engine_state=None, 
         if parsed.hostname != "www.zhipin.com" or not parsed.path.startswith("/job_detail/"):
             raise ValueError("岗位卡片缺少有效的 BOSS 详情链接。")
         job_id = PurePosixPath(parsed.path).stem
-        if job_id in seen:
+        job.update(id=job_id, url=url)
+        key = job_identity(job)
+        if observed_keys is not None:
+            observed_keys.add(key)
+        if key in seen:
             continue
-        seen.add(job_id)
-        job.update(id=job_id, url=url, description=None, description_status="pending")
+        seen.add(key)
+        job.update(description=None, description_status="pending")
         (folder / f"{job_id}-card.html").write_text(html, encoding="utf-8")
         try:
             if needs_ocr(job["salary_raw"]):
@@ -432,12 +438,14 @@ def update_report(payload):
     )
 
 
-def collect_list(cdp, payload, folder, path, list_url, no_prompt, max_scrolls):
-    seen, engine_state, unchanged, scrolls = set(), [None], 0, 0
+def collect_list(cdp, payload, folder, path, list_url, no_prompt, max_scrolls, excluded_keys=None):
+    excluded_keys = set(excluded_keys or ())
+    seen = excluded_keys | {job_identity(job) for job in payload["jobs"]}
+    observed, engine_state, unchanged, scrolls = set(), [None], 0, 0
 
     def save_one(job):
         payload["jobs"].append(job)
-        seen.add(job["id"])
+        seen.add(job_identity(job))
         update_report(payload)
         save_jobs(path, payload)
 
@@ -448,17 +456,22 @@ def collect_list(cdp, payload, folder, path, list_url, no_prompt, max_scrolls):
             require_login(cdp, list_url, no_prompt)
             nodes = wait_cards(cdp)
         before = len(payload["jobs"])
-        read_list(cdp, nodes, folder, skip_ids=seen,
+        observed_before = len(observed)
+        read_list(cdp, nodes, folder, skip_keys=seen,
                   limit=payload["requested_count"] - before,
-                  engine_state=engine_state, on_job=save_one)
+                  engine_state=engine_state, on_job=save_one, observed_keys=observed)
+        payload["historical_skipped_count"] = len(observed & excluded_keys)
+        save_jobs(path, payload)
         if len(payload["jobs"]) >= payload["requested_count"]:
             return "requested_limit_reached"
-        unchanged = unchanged + 1 if len(payload["jobs"]) == before else 0
+        # 前几屏可能全是历史岗位；只要看到了不同的岗位标识，就继续向后加载。
+        unchanged = unchanged + 1 if len(observed) == observed_before else 0
         if unchanged >= 3:
             return "no_new_results_after_scroll"
         if scrolls >= max_scrolls:
             return "max_scrolls_reached"
-        print(f"当前取得 {len(payload['jobs'])}/{payload['requested_count']} 条，继续加载列表……", flush=True)
+        print(f"当前取得 {len(payload['jobs'])}/{payload['requested_count']} 条，"
+              f"已跳过 {payload['historical_skipped_count']} 个历史岗位，继续加载列表……", flush=True)
         scroll_list(cdp, nodes)
         scrolls += 1
         time.sleep(1)
@@ -472,9 +485,16 @@ def main():
     parser.add_argument("--limit", type=int, choices=range(1, 101), default=3, metavar="1-100")
     parser.add_argument("--max-scrolls", type=int, default=12, help="最多滚动加载次数，默认 12")
     parser.add_argument("--no-prompt", action="store_true", help="未确认登录时直接退出，不采集游客数据")
+    parser.add_argument("--include-seen", action="store_true", help="允许再次采集历史岗位，用于复测")
     args = parser.parse_args()
     if args.max_scrolls < 0:
         parser.error("--max-scrolls 不能小于 0")
+    try:
+        excluded_keys, history_files = (set(), 0) if args.include_seen else load_history(OUTPUT / "runs", args.city)
+    except ValueError as exc:
+        parser.error(str(exc))
+    print(f"{'允许重复采集' if args.include_seen else '跨批次去重'}："
+          f"读取 {args.city} 的 {history_files} 份历史结果，按名称与公司排除 {len(excluded_keys)} 个岗位。", flush=True)
     ensure_browser()
     folder = OUTPUT / "runs" / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     folder.mkdir(parents=True)
@@ -482,7 +502,12 @@ def main():
     target = open_task_tab()
     connection = websocket.create_connection(target["webSocketDebuggerUrl"], timeout=10, suppress_origin=True)
     payload = {"keyword": args.keyword, "city": args.city, "status": "running",
-               "requested_count": args.limit, "jobs": []}
+               "requested_count": args.limit, "jobs": [],
+               "deduplication": "within_run" if args.include_seen else "history",
+               "deduplication_fields": ["title", "company"],
+               "deduplication_city": args.city,
+               "history_file_count": history_files, "historical_job_count": len(excluded_keys),
+               "historical_skipped_count": 0}
     try:
         cdp = RawCDP(connection)
         cdp.call("Page.enable")
@@ -493,7 +518,7 @@ def main():
         navigate(cdp, list_url)
         require_login(cdp, list_url, args.no_prompt)
         payload["list_stop_reason"] = collect_list(
-            cdp, payload, folder, path, list_url, args.no_prompt, args.max_scrolls
+            cdp, payload, folder, path, list_url, args.no_prompt, args.max_scrolls, excluded_keys
         )
         print(f"列表取得 {len(payload['jobs'])}/{args.limit} 条，停止原因：{payload['list_stop_reason']}", flush=True)
         save_jobs(path, payload)
