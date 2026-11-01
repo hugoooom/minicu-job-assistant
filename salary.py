@@ -8,6 +8,8 @@ def normalize_salary(observed, reference=""):
     text = re.sub(r"\s+", "", unicodedata.normalize("NFKC", observed))
     raw = re.sub(r"\s+", "", unicodedata.normalize("NFKC", reference))
     text = re.sub(r"[–—~～至]", "-", text)
+    # 局部截图可能带入相邻岗位标题的省略号；仅清理紧邻金额的开头省略号。
+    text = re.sub(r"^(?:\.{2,}|⋯+)(?=\d)", "", text)
     if "面议" in text:
         return {"salary": "面议", "salary_unit": None, "salary_period": None,
                 "salary_pay_months": None, "salary_status": "negotiable"}

@@ -53,6 +53,19 @@ class CoreTests(unittest.TestCase):
         self.assertNotIn("salary_raw", jobs[0])
         self.assertNotIn("\ue031", json.dumps(jobs, ensure_ascii=False))
 
+    def test_salary_ocr_with_adjacent_title_ellipsis_is_saved(self):
+        card = CARD.replace("150–200 元/天", "\ue032\ue031-\ue032\ue036K")
+        result = Mock(txts=(".. 10-15K",), scores=(0.96884,))
+        with tempfile.TemporaryDirectory() as folder, \
+                patch.object(collect_jobs, "outer_html", return_value=card), \
+                patch.object(collect_jobs, "salary_screenshot"), \
+                patch.object(collect_jobs, "RapidOCR") as engine:
+            engine.return_value.return_value = result
+            jobs = collect_jobs.read_list(Mock(), [1], Path(folder))
+        self.assertEqual(jobs[0]["salary"], "10-15K")
+        self.assertEqual(jobs[0]["salary_status"], "ok")
+        self.assertNotIn("salary_error", jobs[0])
+
     def test_rendered_text_excludes_hidden_parent(self):
         strings = ["#document", "P", "#text", "Hello", "hidden", "world",
                    "block", "visible", "1", "16px", "none", "SPAN"]

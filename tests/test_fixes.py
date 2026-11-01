@@ -62,6 +62,22 @@ class LoginTests(unittest.TestCase):
 
 
 class SalaryTests(unittest.TestCase):
+    def test_title_ellipsis_at_crop_edge_does_not_hide_salary(self):
+        for prefix in (".. ", "...", "… ", "⋯"):
+            with self.subTest(prefix=prefix):
+                result = normalize_salary(prefix + "10-15K", "\ue032\ue031-\ue032\ue036K")
+                self.assertEqual(result["salary"], "10-15K")
+                self.assertEqual(result["salary_status"], "ok")
+
+    def test_leading_ellipsis_preserves_decimal_range_and_pay_months(self):
+        self.assertEqual(normalize_salary("...1.5-2万/月")["salary"], "1.5-2万/月")
+        self.assertEqual(normalize_salary("..10-15K·13薪")["salary"], "10-15K·13薪")
+
+    def test_unrelated_prefix_text_is_not_searched_for_any_number(self):
+        for text in ("Python3开发", "本科3-5年10-15K", "..K", ".5-1K"):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                normalize_salary(text)
+
     def test_restore_k_from_dom(self):
         result = normalize_salary("8-10", "\ue037-\ue038K")
         self.assertEqual(result["salary"], "8-10K")
