@@ -52,6 +52,19 @@ python -m venv .venv
 
 结果保存在 `output/runs/运行时间/jobs.json`，同目录包含卡片 HTML、需要 OCR 的薪资截图及职位描述文本。
 
+## 导出 CSV
+
+使用 `turn_csv.py` 将某次采集的 `jobs.json` 导出为表格：
+
+```powershell
+.\.venv\Scripts\python.exe turn_csv.py --input "output/runs/运行时间/jobs.json"
+.\.venv\Scripts\python.exe turn_csv.py --input "output/runs/运行时间/jobs.json" --output "my_jobs.csv"
+```
+
+`--input` 必填；`--output` 可省略，默认在当前工作目录生成 `out.csv`。导出包含岗位、公司、地点、薪资、职位描述及描述状态，使用 UTF-8 BOM 编码，方便 Excel 识别中文。
+
+当前要求输入的岗位列表非空，且每条记录对应的表格中具备上述字段。导出的 CSV 由 Git 忽略规则排除。
+
 ## 输出
 
 以下为虚构样例，仅展示字段：
