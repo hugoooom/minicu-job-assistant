@@ -14,6 +14,7 @@ import websocket
 from rapidocr import RapidOCR
 from salary import normalize_salary
 from job_history import job_identity, load_history
+from turn_csv import export_csv
 
 from extract_first_job import CardParser, needs_ocr
 from inspect_cdp import OUTPUT, PORT, PROFILE, build_command, ensure_port_free, find_edge, wait_for_cdp
@@ -578,9 +579,15 @@ def main():
         except (OSError, RuntimeError, websocket.WebSocketException):
             pass
     print("结果已保存：", path)
+    csv_ok = True
+    try:
+        print("表格已保存：", export_csv(path))
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        csv_ok = False
+        print(f"表格导出失败，JSON 已保留：{exc}", flush=True)
     print(f"请求 {args.limit} 条，列表 {payload['collected_count']} 条，"
           f"薪资成功 {payload['salary_success_count']} 条，详情成功 {payload['description_success_count']} 条。")
-    return 0 if payload["status"] == "complete" else 1
+    return 0 if payload["status"] == "complete" and csv_ok else 1
 
 
 if __name__ == "__main__":

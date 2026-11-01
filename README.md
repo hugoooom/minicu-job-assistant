@@ -51,7 +51,7 @@ python -m venv .venv
 .\.venv\Scripts\python.exe collect_jobs.py --keyword Python --city 广州 --limit 20
 ```
 
-结果保存在 `output/runs/运行时间/jobs.json`，同目录包含卡片 HTML、需要 OCR 的薪资截图及职位描述文本。
+结果保存在 `output/runs/运行时间/jobs.json`，采集结束后自动调用 `turn_csv.py` 的导出函数，在同目录生成同名 `jobs.csv`。同目录包含卡片 HTML、需要 OCR 的薪资截图及职位描述文本。
 
 ### 分批采集
 
@@ -74,16 +74,16 @@ python -m venv .venv
 
 ## 导出 CSV
 
-使用 `turn_csv.py` 将某次采集的 `jobs.json` 导出为表格：
+采集结束后自动导出同目录、同名的 CSV；部分完成或停止的批次也导出已保存的岗位，空批次生成只有表头的 CSV。也可单独使用 `turn_csv.py` 导出历史 JSON：
 
 ```powershell
 .\.venv\Scripts\python.exe turn_csv.py --input "output/runs/运行时间/jobs.json"
 .\.venv\Scripts\python.exe turn_csv.py --input "output/runs/运行时间/jobs.json" --output "my_jobs.csv"
 ```
 
-`--input` 必填；`--output` 可省略，默认在当前工作目录生成 `out.csv`。导出包含岗位、公司、地点、薪资、职位描述及描述状态，使用 UTF-8 BOM 编码，方便 Excel 识别中文。
+`--input` 必填；`--output` 可省略，默认与 JSON 同目录、同名，例如 `jobs.json` 对应 `jobs.csv`。导出包含岗位、公司、地点、薪资、职位描述及描述状态，使用 UTF-8 BOM 编码，方便 Excel 识别中文。
 
-当前要求输入的岗位列表非空，且每条记录对应的表格中具备上述字段。导出的 CSV 由 Git 忽略规则排除。
+缺少字段导出为空，空岗位列表保留表头。CSV 导出失败会明确提示，已保存的 JSON 保留，可关闭占用文件的 Excel 后单独重新导出。导出的 CSV 由 Git 忽略规则排除。
 
 ## 输出
 
