@@ -334,11 +334,15 @@ def read_list(cdp, nodes, folder, skip_keys=None, limit=None, engine_state=None,
 def read_description(cdp, job, folder, timeout=20):
     navigate(cdp, job["url"])
     deadline = time.monotonic() + timeout
+    candidate, candidate_since = None, None
+    last_reason = "页面尚未就绪"
     while time.monotonic() < deadline:
         try:
             root = document(cdp)
             current = urlsplit(root.get("documentURL", ""))
             if current.path != urlsplit(job["url"]).path:
+                candidate, candidate_since = None, None
+                last_reason = "当前页面 URL 与目标岗位不一致"
                 check_gate(rendered_text(snapshot(cdp)))
                 time.sleep(0.4)
                 continue
@@ -350,11 +354,23 @@ def read_description(cdp, job, folder, timeout=20):
                 check_gate(page_text)
                 if authentication_state(cdp, root, page_text) != "authenticated":
                     raise LoginRequired("详情已出现，但未确认已登录，不能将游客预览视作完整描述。")
-                text = rendered_text(data, backend)
+                text = rendered_text(data, backend).strip()
+                now = time.monotonic()
+                loading = text.strip(" .…。，\t\r\n").casefold() in ("加载中", "正在加载", "loading")
+                if text and not needs_ocr(text) and not loading:
+                    if text != candidate:
+                        candidate, candidate_since = text, now
+                    # 短正文也可能完整；稍等文字稳定，避免把刚加载的片段当作正文。
+                    dom_ready = len(text) >= 40 or now - candidate_since >= 1
+                    last_reason = f"正文共 {len(text)} 字符，等待文字稳定"
+                else:
+                    candidate, candidate_since = None, None
+                    dom_ready = False
+                    last_reason = "正文仍在加载" if loading else "正文为空或含混淆字符"
                 ocr_ready = needs_ocr(text) and (
-                    bool(text) or time.monotonic() >= deadline - timeout + 2
+                    bool(text) or now >= deadline - timeout + 2
                 )
-                if len(text) >= 40 or ocr_ready:
+                if dom_ready or ocr_ready:
                     if needs_ocr(text):
                         from description_ocr import extract_description
 
@@ -390,13 +406,17 @@ def read_description(cdp, job, folder, timeout=20):
                         job["description_source"] = "CDP_DOMSnapshot"
                     (folder / f"{job['id']}-description.txt").write_text(text, encoding="utf-8")
                     return text
+            else:
+                candidate, candidate_since = None, None
+                last_reason = "未找到职位描述容器"
         except AccessGate:
             raise
-        except RuntimeError:
-            pass
+        except RuntimeError as exc:
+            candidate, candidate_since = None, None
+            last_reason = f"读取页面失败：{exc}"
         time.sleep(0.4)
     check_gate(rendered_text(snapshot(cdp)))
-    raise TimeoutError("未获取到与岗位 ID 对应的职位描述；可能是跳转、内容未加载或选择器变化。")
+    raise TimeoutError(f"未获取到与岗位 ID 对应的职位描述：{last_reason}。")
 
 
 def save_jobs(path, payload):
