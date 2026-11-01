@@ -75,7 +75,7 @@ class HistoryTests(unittest.TestCase):
                 ]})
                 argv = ["collect_jobs.py", "--limit", "1"] + (["--include-seen"] if include_seen else [])
                 with patch("sys.argv", argv), patch.object(app, "OUTPUT", output), \
-                        patch.object(app, "ensure_browser"), patch.object(app, "open_task_tab", return_value={
+                        patch.object(app, "check_ocr_runtime"), patch.object(app, "ensure_browser"), patch.object(app, "open_task_tab", return_value={
                             "id": "task", "webSocketDebuggerUrl": "ws://test"}), \
                         patch.object(app.websocket, "create_connection"), patch.object(app, "RawCDP"), \
                         patch.object(app, "navigate"), patch.object(app, "require_login"), \

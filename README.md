@@ -29,12 +29,28 @@ git clone https://github.com/hugoooom/minicu-job-assistant.git
 cd minicu-job-assistant
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -c "import onnxruntime; print(onnxruntime.__version__)"
 .\.venv\Scripts\python.exe collect_jobs.py --keyword Python --city 广州 --limit 3
 ```
 
 自动采集入口使用系统 Edge，不需要额外下载 Playwright Chromium。首次 OCR 运行可能下载模型。
 
 首次登录或登录过期时，需要在专用浏览器中手动完成登录。正常登录状态下，搜索、读取列表、打开详情和保存结果均自动完成。
+
+### Windows 依赖排查
+
+`ImportError: onnxruntime is not installed.` 表示运行脚本的 Python 无法加载 OCR 推理依赖。只安装 `rapidocr` 不足以准备本项目环境；完整依赖已列在 `requirements.txt`。请始终用同一个 Python 安装和运行，推荐使用上面的 `.venv` 命令。下载 ZIP 的用户请在解压后包含 `requirements.txt` 的项目目录打开 PowerShell。
+
+若仍报错，先直接导入查看底层异常：
+
+```powershell
+.\.venv\Scripts\python.exe -c "import sys; print(sys.executable); import onnxruntime; print(onnxruntime.__version__)"
+.\.venv\Scripts\python.exe -m pip check
+```
+
+如果提示缺少模块，用该环境重新执行 `-m pip install -r requirements.txt`；若提示 `DLL load failed`，按 [ONNX Runtime 官方安装说明](https://onnxruntime.ai/docs/install/) 检查 Windows Visual C++ 运行库及 Python 架构。建议使用 64 位 Python 3.12 或 3.13。
+
+程序会在打开任务浏览器前检查 `onnxruntime` 的实际导入与可用推理提供程序。程序正常结束或出错停止时，会关闭自己创建的任务标签页并明确提示；这与程序运行中网页跳转到 `about:blank` 是两种现象。
 
 | 参数 | 说明 |
 |---|---|

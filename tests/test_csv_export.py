@@ -44,7 +44,7 @@ class CsvExportTests(unittest.TestCase):
             self.assertEqual(json.loads(path.read_text(encoding="utf-8")), {"jobs": []})
 
     def test_collection_exports_final_records_and_preserves_json_on_export_failure(self):
-        for case in ("complete", "stopped", "export_failure"):
+        for case in ("complete", "stopped", "export_failure", "missing_ocr"):
             with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
                 output = Path(directory)
 
@@ -53,10 +53,12 @@ class CsvExportTests(unittest.TestCase):
                                             "salary": "150元/天", "salary_status": "ok", "description_status": "pending"})
                     if case == "stopped":
                         raise app.AccessGate("访问过于频繁")
+                    if case == "missing_ocr":
+                        raise ImportError("onnxruntime is not installed.")
                     return "requested_limit_reached"
 
                 with patch("sys.argv", ["collect_jobs.py", "--limit", "1"]), \
-                        patch.object(app, "OUTPUT", output), patch.object(app, "ensure_browser"), \
+                        patch.object(app, "OUTPUT", output), patch.object(app, "check_ocr_runtime"), patch.object(app, "ensure_browser"), \
                         patch.object(app, "open_task_tab", return_value={"id": "task", "webSocketDebuggerUrl": "ws://test"}), \
                         patch.object(app.websocket, "create_connection"), patch.object(app, "RawCDP"), \
                         patch.object(app, "navigate"), patch.object(app, "require_login"), \
@@ -69,13 +71,13 @@ class CsvExportTests(unittest.TestCase):
                 close.assert_called_once_with("task")
                 path = next((output / "runs").glob("*/jobs.json"))
                 report = json.loads(path.read_text(encoding="utf-8"))
-                self.assertEqual(report["status"], "stopped" if case == "stopped" else "complete")
+                self.assertEqual(report["status"], "stopped" if case in ("stopped", "missing_ocr") else "complete")
                 if case == "export_failure":
                     self.assertFalse(path.with_suffix(".csv").exists())
                 else:
                     with path.with_suffix(".csv").open(encoding="utf-8-sig", newline="") as f:
                         row = next(csv.DictReader(f))
-                    self.assertEqual(row["description_status"], "not_processed" if case == "stopped" else "ok")
+                    self.assertEqual(row["description_status"], "not_processed" if case in ("stopped", "missing_ocr") else "ok")
 
 
 if __name__ == "__main__":

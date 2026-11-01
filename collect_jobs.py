@@ -15,6 +15,7 @@ from rapidocr import RapidOCR
 from salary import normalize_salary
 from job_history import job_identity, load_history
 from turn_csv import export_csv
+from runtime_check import check_ocr_runtime
 
 from extract_first_job import CardParser, needs_ocr
 from inspect_cdp import OUTPUT, PORT, PROFILE, build_command, ensure_port_free, find_edge, wait_for_cdp
@@ -512,6 +513,11 @@ def main():
     if args.max_scrolls < 0:
         parser.error("--max-scrolls 不能小于 0")
     try:
+        check_ocr_runtime()
+    except RuntimeError as exc:
+        print(exc, flush=True)
+        return 1
+    try:
         excluded_keys, history_files = (set(), 0) if args.include_seen else load_history(OUTPUT / "runs", args.city)
     except ValueError as exc:
         parser.error(str(exc))
@@ -564,7 +570,7 @@ def main():
                 time.sleep(2)
         update_report(payload)
         payload["status"] = "complete" if payload["fully_extracted_count"] == args.limit else "partial"
-    except (RuntimeError, ValueError, OSError, websocket.WebSocketException) as exc:
+    except (ImportError, RuntimeError, ValueError, OSError, websocket.WebSocketException) as exc:
         payload.update(status="stopped", error=str(exc))
         print("本轮停止：", exc, flush=True)
     finally:
@@ -576,6 +582,7 @@ def main():
         save_jobs(path, payload)
         connection.close()
         try:
+            print("本轮结束，关闭程序创建的任务标签页。", flush=True)
             close_task_tab(target["id"])
         except (OSError, RuntimeError, websocket.WebSocketException):
             pass
