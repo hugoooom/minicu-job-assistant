@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import Mock, patch
 
-from collect_jobs import screenshot_geometry, stable_screenshot_geometry
+from collect_jobs import screenshot_geometry, stable_screenshot_geometry, scroll_list
 
 
 def metrics(x=0, y=0):
@@ -9,6 +9,16 @@ def metrics(x=0, y=0):
 
 
 class ScreenshotTests(unittest.TestCase):
+    def test_wheel_stays_over_card_after_deep_page_scroll(self):
+        cdp = Mock()
+        cdp.call.side_effect = [None,
+            {"model": {"border": [200, 400, 600, 400, 600, 600, 200, 600]}},
+            {"cssVisualViewport": {"pageX": 100, "pageY": 20000, "clientWidth": 1000, "clientHeight": 700}},
+            None]
+        scroll_list(cdp, [7])
+        cdp.call.assert_called_with("Input.dispatchMouseEvent", {
+            "type": "mouseWheel", "x": 400, "y": 500, "deltaX": 0, "deltaY": 650})
+
     def test_scrolled_viewport_coordinates_become_document_coordinates(self):
         result = screenshot_geometry([20, 638, 120, 638, 120, 662, 20, 662], metrics(y=2724))
         self.assertEqual(result["clip"], {"x": 12, "y": 3354, "width": 116, "height": 40, "scale": 2})

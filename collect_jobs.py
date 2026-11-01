@@ -439,8 +439,9 @@ def scroll_list(cdp, nodes):
     cdp.call("DOM.scrollIntoViewIfNeeded", {"nodeId": last})
     box = cdp.call("DOM.getBoxModel", {"nodeId": last})["model"]["border"]
     viewport = cdp.call("Page.getLayoutMetrics")["cssVisualViewport"]
-    x = (min(box[0::2]) + max(box[0::2])) / 2 - viewport["pageX"]
-    y = (min(box[1::2]) + max(box[1::2])) / 2 - viewport["pageY"]
+    # 元素边界和鼠标事件都使用视口坐标，不重复减去页面滚动偏移。
+    x = (min(box[0::2]) + max(box[0::2])) / 2
+    y = (min(box[1::2]) + max(box[1::2])) / 2
     x = max(1, min(x, viewport["clientWidth"] - 1))
     y = max(1, min(y, viewport["clientHeight"] - 1))
     cdp.call("Input.dispatchMouseEvent", {

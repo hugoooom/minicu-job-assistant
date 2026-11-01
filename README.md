@@ -4,6 +4,8 @@
 
 当前实现面向 Windows + Microsoft Edge，适合学习浏览器自动化、数据提取和后续求职筛选。
 
+当前为早期测试版，支持广州、深圳搜索，需要在本机专用 Edge 中手动登录。建议首次采集 3 条，核对 JSON 和 CSV 后再增加数量。实测范围与已知问题见 [TESTING.md](TESTING.md)。
+
 ## 功能
 
 - 独立启动或复用专用 Edge，使用单独的浏览器资料目录。
@@ -23,6 +25,8 @@
 需要 Python 3.12 或 3.13，以及 Microsoft Edge。
 
 ```powershell
+git clone https://github.com/hugoooom/minicu-job-assistant.git
+cd minicu-job-assistant
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 .\.venv\Scripts\python.exe collect_jobs.py --keyword Python --city 广州 --limit 3
@@ -136,6 +140,10 @@ python -m venv .venv
 离线测试使用虚构样例，不访问招聘平台。本版本于 2026-10-31 在开发机器完成连续 3 个岗位的实际采集与职位描述读取；其他环境、页面版本和登录状态仍需验证。
 
 2026-11-01 针对一条仅 18 字符的真实职位描述验证：确认 URL、登录状态且文字稳定后正常保存，不再因不足 40 字符超时。此验证只覆盖该条短正文样例。
+
+## 反馈问题
+
+请在 [Issues](https://github.com/hugoooom/minicu-job-assistant/issues) 提供 Windows、Edge、Python 版本、运行参数、完整报错，以及预期结果和实际结果。截图和日志请先遮挡个人信息；不要上传专用浏览器目录、Cookie 或登录凭据。
 
 ## 当前边界
 
