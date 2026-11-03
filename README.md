@@ -105,6 +105,35 @@ python -m venv .venv
 
 缺少字段导出为空，空岗位列表保留表头。CSV 导出失败会明确提示，已保存的 JSON 保留，可关闭占用文件的 Excel 后单独重新导出。导出的 CSV 由 Git 忽略规则排除。
 
+## 本地 SQLite 数据库
+
+`job_db.py` 使用 Python 自带的 SQLite，将多个批次合并到一个数据库文件，默认位置为项目的 `output/jobs.db`。无需 MySQL 服务、账号或密码，也无需安装 PyMySQL。
+
+```powershell
+# 只创建数据库与表（导入时也会自动创建）
+python job_db.py --init
+# 导入一份批次
+python job_db.py --input "output/runs/运行时间/jobs.json"
+# 一次导入本项目所有历史批次
+python job_db.py --input output/runs
+# 指定另一个数据库文件
+python job_db.py --input output/runs --db "output/test-jobs.db"
+```
+
+统一使用一张 `jobs` 表，按“搜索城市 + 搜索关键词 + 岗位标识”合并。岗位标识沿用现有的名称与公司组合，缺少名称/公司时退回平台 ID；内部比较统一全角半角、空白和英文大小写，展示字段保留原文。同组重复导入不会增加行，不同城市或关键词独立保留。
+
+有效的薪资及成功描述按导入顺序更新；失败、空值或尚未处理的结果不覆盖已有有效字段。OCR 描述的待核对标记同时保留。`source_file` 记录最近导入来源，`first_imported_at`、`last_imported_at` 是入库时间，不是岗位发布时间。若需要只保留最新采集版本，请按批次时间顺序导入；目录导入按路径排序。
+
+命令会显示各城市与关键词的数量。可以使用 Navicat 的 SQLite 连接打开 `output/jobs.db`，查询：
+
+```sql
+SELECT city, keyword, COUNT(*) AS job_count
+FROM jobs
+GROUP BY city_key, keyword_key;
+```
+
+这是本地 JSON 入库工具，采集结束后仍需运行入库命令；不会自动迁移 MySQL 数据。可以重新导入已有 JSON。历史 JSON 中没有的岗位无法凭空补入某个关键词组；采集端目前仍按城市跨关键词去重，数据库分组不会改变该采集规则。`output/` 已被 Git 忽略，数据库和登录状态都不上传。
+
 ## 输出
 
 以下为虚构样例，仅展示字段：
@@ -139,6 +168,7 @@ python -m venv .venv
 | `extract_first_job.py` | 卡片字段解析及 OCR 回退判断 |
 | `salary.py` | 薪资格式、单位和发薪后缀整理 |
 | `job_history.py` | 岗位名称与公司名称标准化、跨批次历史恢复 |
+| `job_db.py` | SQLite 初始化、跨批次合并和分组统计 |
 | `description_ocr.py` | 正文分段截图、多行 OCR 和重叠区合并 |
 | `inspect_cdp.py` | 独立 Edge 启动和端口检查；另含 Playwright 对照实验 |
 | `inspect_raw_cdp.py` | 原生 CDP 客户端及诊断实验 |

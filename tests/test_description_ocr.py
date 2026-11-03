@@ -1,4 +1,5 @@
 import base64
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -46,11 +47,18 @@ class DescriptionOCRTests(unittest.TestCase):
             {"viewport_rect": {"x": 10, "y": 100, "width": 500, "height": 700}, "page_scroll": {"x": 0, "y": 0}},
             {"viewport_rect": {"x": 10, "y": 100, "width": 500, "height": 700}, "page_scroll": {"x": 0, "y": 0}},
             {"viewport_rect": {"x": 10, "y": -300, "width": 500, "height": 700}, "page_scroll": {"x": 0, "y": 400}},
+            {"viewport_rect": {"x": 10, "y": -300, "width": 500, "height": 700}, "page_scroll": {"x": 0, "y": 400}},
         ])
         first, second = "岗位职责：负责后端开发与接口设计。" * 3, "任职要求：掌握数据库与测试方法。" * 3
         boxes = [[[0, 100], [400, 100], [400, 140], [0, 140]]]
-        engine = Mock(side_effect=[Mock(txts=(first,), scores=(0.99,), boxes=boxes),
-                                   Mock(txts=(second,), scores=(0.98,), boxes=boxes)])
+        results = iter([Mock(txts=(first,), scores=(0.99,), boxes=boxes),
+                        Mock(txts=(second,), scores=(0.98,), boxes=boxes)])
+        def recognize(path, **kwargs):
+            # 第一段开始识别时，两段截图及完整坐标清单都必须已经落盘。
+            self.assertTrue((Path(path).parent / "job-description-02.png").exists())
+            self.assertTrue((Path(path).parent / "job-description-captures.json").exists())
+            return next(results)
+        engine = Mock(side_effect=recognize)
         with tempfile.TemporaryDirectory() as directory:
             folder = Path(directory)
             with patch.object(ocr, "_engine", engine):
@@ -61,6 +69,8 @@ class DescriptionOCRTests(unittest.TestCase):
             self.assertEqual(len(metadata["description_ocr_images"]), 2)
             self.assertTrue(metadata["description_ocr_review_required"])
             self.assertTrue((folder / "job-description-ocr.json").exists())
+            saved = json.loads((folder / "job-description-ocr.json").read_text(encoding="utf-8"))
+            self.assertEqual([item["y"] for item in saved["lines"]], [60, 492])
         for call_args in engine.call_args_list:
             self.assertTrue(call_args.kwargs["use_det"])
 

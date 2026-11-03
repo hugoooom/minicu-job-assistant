@@ -5,6 +5,7 @@ import base64
 import json
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import PurePosixPath
 from urllib.parse import urlencode, urljoin, urlsplit
@@ -16,6 +17,7 @@ from salary import normalize_salary
 from job_history import job_identity, load_history
 from turn_csv import export_csv
 from runtime_check import check_ocr_runtime
+from description_ocr import CapturedDescription, DescriptionOCRWorker, capture_description
 
 from extract_first_job import CardParser, needs_ocr
 from inspect_cdp import OUTPUT, PORT, PROFILE, build_command, ensure_port_free, find_edge, wait_for_cdp
@@ -333,7 +335,7 @@ def read_list(cdp, nodes, folder, skip_keys=None, limit=None, engine_state=None,
     return jobs
 
 
-def read_description(cdp, job, folder, timeout=20):
+def read_description(cdp, job, folder, timeout=20, capture_only=False):
     navigate(cdp, job["url"])
     deadline = time.monotonic() + timeout
     candidate, candidate_since = None, None
@@ -393,6 +395,11 @@ def read_description(cdp, job, folder, timeout=20):
                             return fresh_node
 
                         try:
+                            if capture_only:
+                                return capture_description(
+                                    cdp, description_id, folder, job["id"], stable_screenshot_geometry,
+                                    guard, resolve_description_node
+                                )
                             text, metadata = extract_description(
                                 cdp, description_id, folder, job["id"], stable_screenshot_geometry,
                                 guard, resolve_description_node
@@ -427,12 +434,12 @@ def save_jobs(path, payload):
     temporary.replace(path)
 
 
-def read_description_with_login(cdp, job, folder, no_prompt=False):
+def read_description_with_login(cdp, job, folder, no_prompt=False, capture_only=False):
     try:
-        return read_description(cdp, job, folder)
+        return read_description(cdp, job, folder, capture_only=capture_only)
     except LoginRequired:
         require_login(cdp, job["url"], no_prompt=no_prompt)
-        return read_description(cdp, job, folder)
+        return read_description(cdp, job, folder, capture_only=capture_only)
 
 
 def scroll_list(cdp, nodes):
@@ -501,6 +508,93 @@ def collect_list(cdp, payload, folder, path, list_url, no_prompt, max_scrolls, e
     return "requested_limit_reached"
 
 
+def collect_details(cdp, payload, folder, path, no_prompt=False, max_pending=2):
+    """单页面串行采集，单本地 OCR 工作器；只有主线程更新岗位和总文件。"""
+    if max_pending < 1:
+        raise ValueError("OCR 待处理上限必须至少为 1。")
+    started = time.perf_counter()
+    pending = []
+
+    def persist():
+        update_report(payload)
+        save_jobs(path, payload)
+
+    def accept(job, text, metadata):
+        if needs_ocr(text):
+            raise ValueError("正文为空或仍含混淆字符。")
+        (folder / f"{job['id']}-description.txt").write_text(text, encoding="utf-8")
+        job.update(metadata)
+        job.update(description=text, description_status="ok", description_characters=len(text))
+        job.pop("description_error", None)
+        print(f"  已保存 {job['title']} 的职位描述，{len(text)} 字符。", flush=True)
+
+    def finish(item):
+        job, future = item
+        try:
+            text, metadata = future.result()
+            accept(job, text, metadata)
+        except Exception as exc:
+            # 工作器异常只归属该岗位；不能让一个模型/图片错误丢弃整批结果。
+            job.update(description_status="error", description_error=f"本地 OCR 失败：{exc}")
+            print(f"  {job['title']} 本地 OCR 失败：{exc}", flush=True)
+        persist()
+
+    worker = DescriptionOCRWorker()
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="jd-ocr") as executor:
+        try:
+            for index, job in enumerate(payload["jobs"], start=1):
+                for item in pending[:]:
+                    if item[1].done():
+                        finish(item)
+                        pending.remove(item)
+                # 提交前限流：连同正在执行的任务，最多保留两份待处理 JD。
+                while len(pending) >= max_pending:
+                    finish(pending[0])
+                    pending.pop(0)
+                print(f"详情 {index}/{len(payload['jobs'])}：{job['title']}", flush=True)
+                page_started = time.perf_counter()
+                try:
+                    result = read_description_with_login(cdp, job, folder, no_prompt, capture_only=True)
+                    if isinstance(result, CapturedDescription):
+                        if result.job_id != job["id"]:
+                            raise ValueError("截图岗位标识与当前任务不一致。")
+                        job.update(description_status="ocr_pending", description_source="OCR",
+                                   description_capture_manifest=result.manifest_path.name)
+                        persist()
+                        pending.append((job, executor.submit(worker, result)))
+                        print("  本岗位截图已全部保存，后台识别中……", flush=True)
+                    else:
+                        accept(job, result, {"description_source": "CDP_DOMSnapshot"})
+                except AccessGate as exc:
+                    job.update(description_status="blocked", description_error=str(exc))
+                    raise
+                except (RuntimeError, ValueError, OSError, websocket.WebSocketException) as exc:
+                    job.update(description_status="error", description_error=str(exc))
+                    print("  本岗位详情未完成：", exc, flush=True)
+                finally:
+                    job["description_page_seconds"] = time.perf_counter() - page_started
+                    persist()
+                if index < len(payload["jobs"]):
+                    # 保持原有页面访问间隔；工作器可以利用这段时间识别。
+                    time.sleep(2)
+        finally:
+            # 登录/访问受阻或用户中断时，也回收已经完整截图的本地任务。
+            interrupted = False
+            for item in pending:
+                try:
+                    finish(item)
+                except KeyboardInterrupt:
+                    if interrupted:
+                        raise
+                    interrupted = True
+                    print("正在保存已截图岗位的 OCR 结果，请等待本地识别完成……", flush=True)
+                    finish(item)
+            payload["detail_pipeline_seconds"] = time.perf_counter() - started
+            persist()
+            if interrupted:
+                raise KeyboardInterrupt()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--keyword", default="Python")
@@ -550,32 +644,15 @@ def main():
         )
         print(f"列表取得 {len(payload['jobs'])}/{args.limit} 条，停止原因：{payload['list_stop_reason']}", flush=True)
         save_jobs(path, payload)
-        for index, job in enumerate(payload["jobs"], start=1):
-            print(f"详情 {index}/{len(payload['jobs'])}：{job['title']}", flush=True)
-            try:
-                job["description"] = read_description_with_login(cdp, job, folder, args.no_prompt)
-                job.setdefault("description_source", "CDP_DOMSnapshot")
-                job["description_status"] = "ok"
-                job["description_characters"] = len(job["description"])
-                print(f"  已保存职位描述，{len(job['description'])} 字符。", flush=True)
-            except AccessGate as exc:
-                job.update(description_status="blocked", description_error=str(exc))
-                raise
-            except (RuntimeError, ValueError, OSError, websocket.WebSocketException) as exc:
-                job.update(description_status="error", description_error=str(exc))
-                print("  本岗位详情未完成：", exc, flush=True)
-            update_report(payload)
-            save_jobs(path, payload)
-            if index < len(payload["jobs"]):
-                time.sleep(2)
+        collect_details(cdp, payload, folder, path, args.no_prompt)
         update_report(payload)
         payload["status"] = "complete" if payload["fully_extracted_count"] == args.limit else "partial"
-    except (ImportError, RuntimeError, ValueError, OSError, websocket.WebSocketException) as exc:
-        payload.update(status="stopped", error=str(exc))
+    except (KeyboardInterrupt, ImportError, RuntimeError, ValueError, OSError, websocket.WebSocketException) as exc:
+        payload.update(status="stopped", error=str(exc) or "用户中断采集。")
         print("本轮停止：", exc, flush=True)
     finally:
         for job in payload["jobs"]:
-            if job["description_status"] == "pending":
+            if job["description_status"] in ("pending", "ocr_pending"):
                 job.update(description_status="not_processed",
                            description_error=payload.get("error", "本轮尚未处理到此岗位。"))
         update_report(payload)
