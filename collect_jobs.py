@@ -468,10 +468,19 @@ def update_report(payload):
     )
 
 
+def list_scroll_budget(historical_count, explicit_limit=None):
+    """保留 12 次基础预算，按约 15 条/屏增加翻过历史岗位的余量。"""
+    if explicit_limit is not None:
+        return explicit_limit
+    return 12 + (historical_count + 14) // 15
+
+
 def collect_list(cdp, payload, folder, path, list_url, no_prompt, max_scrolls, excluded_keys=None):
     excluded_keys = set(excluded_keys or ())
     seen = excluded_keys | {job_identity(job) for job in payload["jobs"]}
     observed, engine_state, unchanged, scrolls = set(), [None], 0, 0
+    payload["list_scroll_limit"] = max_scrolls
+    payload["list_scroll_count"] = 0
 
     def save_one(job):
         payload["jobs"].append(job)
@@ -504,6 +513,7 @@ def collect_list(cdp, payload, folder, path, list_url, no_prompt, max_scrolls, e
               f"已跳过 {payload['historical_skipped_count']} 个历史岗位，继续加载列表……", flush=True)
         scroll_list(cdp, nodes)
         scrolls += 1
+        payload["list_scroll_count"] = scrolls
         time.sleep(1)
     return "requested_limit_reached"
 
@@ -600,11 +610,11 @@ def main():
     parser.add_argument("--keyword", default="Python")
     parser.add_argument("--city", choices=CITY_CODES, default="广州")
     parser.add_argument("--limit", type=int, choices=range(1, 101), default=3, metavar="1-100")
-    parser.add_argument("--max-scrolls", type=int, default=12, help="最多滚动加载次数，默认 12")
+    parser.add_argument("--max-scrolls", type=int, help="最多滚动加载次数；默认按当前城市历史岗位数自动增加")
     parser.add_argument("--no-prompt", action="store_true", help="未确认登录时直接退出，不采集游客数据")
     parser.add_argument("--include-seen", action="store_true", help="允许再次采集历史岗位，用于复测")
     args = parser.parse_args()
-    if args.max_scrolls < 0:
+    if args.max_scrolls is not None and args.max_scrolls < 0:
         parser.error("--max-scrolls 不能小于 0")
     try:
         check_ocr_runtime()
@@ -617,6 +627,9 @@ def main():
         parser.error(str(exc))
     print(f"{'允许重复采集' if args.include_seen else '跨批次去重'}："
           f"读取 {args.city} 的 {history_files} 份历史结果，按名称与公司排除 {len(excluded_keys)} 个岗位。", flush=True)
+    max_scrolls = list_scroll_budget(len(excluded_keys), args.max_scrolls)
+    print(f"列表滚动上限：{max_scrolls} 次（{'手动指定' if args.max_scrolls is not None else '按历史数量自动估算'}）；"
+          "连续三轮未看到不同岗位时提前结束。", flush=True)
     ensure_browser()
     folder = OUTPUT / "runs" / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     folder.mkdir(parents=True)
@@ -629,7 +642,8 @@ def main():
                "deduplication_fields": ["title", "company"],
                "deduplication_city": args.city,
                "history_file_count": history_files, "historical_job_count": len(excluded_keys),
-               "historical_skipped_count": 0}
+               "historical_skipped_count": 0, "list_scroll_limit": max_scrolls,
+               "list_scroll_budget_mode": "manual" if args.max_scrolls is not None else "automatic"}
     try:
         cdp = RawCDP(connection)
         cdp.call("Page.enable")
@@ -640,9 +654,12 @@ def main():
         navigate(cdp, list_url)
         require_login(cdp, list_url, args.no_prompt)
         payload["list_stop_reason"] = collect_list(
-            cdp, payload, folder, path, list_url, args.no_prompt, args.max_scrolls, excluded_keys
+            cdp, payload, folder, path, list_url, args.no_prompt, max_scrolls, excluded_keys
         )
         print(f"列表取得 {len(payload['jobs'])}/{args.limit} 条，停止原因：{payload['list_stop_reason']}", flush=True)
+        if payload["list_stop_reason"] == "max_scrolls_reached":
+            print(f"滚动次数已用完；本轮跳过 {payload['historical_skipped_count']} 个历史岗位。"
+                  f"可用 --max-scrolls {max_scrolls + 12} 增加下一轮预算，仍会保留历史去重。", flush=True)
         save_jobs(path, payload)
         collect_details(cdp, payload, folder, path, args.no_prompt)
         update_report(payload)

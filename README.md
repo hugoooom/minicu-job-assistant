@@ -57,7 +57,7 @@ python -m venv .venv
 | `--keyword` | 搜索关键词，默认 Python |
 | `--city` | 广州或深圳，默认广州 |
 | `--limit` | 本轮最多处理 1–100 个岗位，默认 3 |
-| `--max-scrolls` | 最多滚动加载次数，默认 12；连续三轮无新增时提前结束 |
+| `--max-scrolls` | 最多滚动加载次数；省略时为 `12 + 向上取整(当前城市历史岗位数 / 15)`，连续三轮没有看到不同岗位时提前结束；显式传入时使用指定值，`0` 表示只读取首屏 |
 | `--no-prompt` | 未确认登录时直接退出，不采集游客数据 |
 | `--include-seen` | 允许再次采集历史岗位，用于复测；本轮内仍按名称与公司去重 |
 
@@ -88,7 +88,7 @@ python -m venv .venv
 .\.venv\Scripts\python.exe collect_jobs.py --keyword Python --city 广州 --limit 5 --include-seen
 ```
 
-`historical_job_count` 为当前城市的历史唯一岗位标识总数，`historical_skipped_count` 为本轮实际遇到并跳过的历史唯一岗位数；`deduplication_fields` 记录名称与公司字段，`deduplication_city` 记录去重的搜索城市范围。列表没有更多新岗位或达到滚动上限时，会报告不足条数，不用重复岗位补齐。后续批次可能需要适当增加 `--max-scrolls`。
+`historical_job_count` 为当前城市的历史唯一岗位标识总数，`historical_skipped_count` 为本轮实际遇到并跳过的历史唯一岗位数；`deduplication_fields` 记录名称与公司字段，`deduplication_city` 记录去重的搜索城市范围。列表没有更多新岗位或达到滚动上限时，会报告不足条数，不用重复岗位补齐。默认预算按约 15 条/屏为历史岗位增加翻页余量：例如 233 个历史岗位对应 28 次滚动。该数量只是估算，不保证一定找到足够的新岗位；可显式增加 `--max-scrolls`。使用 `--include-seen` 时历史排除数量为 0，自动预算回到 12 次。`list_scroll_limit`、`list_scroll_count` 和 `list_scroll_budget_mode` 分别记录本轮上限、实际次数和预算模式。
 
 去重依赖本地历史结果：删除、移动历史 `jobs.json` 会失去对应记录，旧项目目录的结果不会自动导入。岗位名称或公司名称变化时可能视为新岗位。请依次运行批次；并行运行的批次不保证互相排除尚未保存的岗位。
 

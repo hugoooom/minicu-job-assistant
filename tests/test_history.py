@@ -18,6 +18,48 @@ def identity(node):
 
 
 class HistoryTests(unittest.TestCase):
+    def test_default_budget_reaches_new_job_after_233_historical_jobs(self):
+        excluded = {identity(n) for n in range(1, 234)}
+        for manual_limit, expected_reason, expected_jobs in (
+                (12, "max_scrolls_reached", []),
+                (None, "requested_limit_reached", ["job234"])):
+            with self.subTest(limit=manual_limit), tempfile.TemporaryDirectory() as directory:
+                folder = Path(directory)
+                payload = {"requested_count": 1, "jobs": []}
+                screens = [list(range(15 * n + 1, 15 * n + 16)) for n in range(17)]
+                budget = app.list_scroll_budget(len(excluded), manual_limit)
+                with patch.object(app, "wait_cards", side_effect=screens), \
+                        patch.object(app, "outer_html", side_effect=card), \
+                        patch.object(app, "scroll_list") as scroll, patch.object(app.time, "sleep"):
+                    reason = app.collect_list(Mock(), payload, folder, folder / "jobs.json",
+                                              "url", True, budget, excluded)
+                self.assertEqual(reason, expected_reason)
+                self.assertEqual([job["id"] for job in payload["jobs"]], expected_jobs)
+                self.assertEqual(payload["list_scroll_count"], scroll.call_count)
+                if manual_limit is None:
+                    self.assertEqual(budget, 28)
+                    self.assertEqual(payload["historical_skipped_count"], 233)
+                    self.assertGreater(scroll.call_count, 12)
+
+    def test_cli_budget_uses_history_but_respects_manual_zero_and_include_seen(self):
+        for flags, expected, mode in (([], 28, "automatic"), (["--max-scrolls", "0"], 0, "manual"),
+                                      (["--max-scrolls", "60"], 60, "manual"),
+                                      (["--include-seen"], 12, "automatic")):
+            with self.subTest(flags=flags), tempfile.TemporaryDirectory() as directory:
+                folder = Path(directory)
+                with patch("sys.argv", ["collect_jobs.py", "--limit", "100"] + flags), \
+                        patch.object(app, "OUTPUT", folder), patch.object(app, "check_ocr_runtime"), \
+                        patch.object(app, "load_history", return_value=({identity(n) for n in range(1, 234)}, 10)), \
+                        patch.object(app, "ensure_browser"), patch.object(app, "open_task_tab", return_value={"id": "task", "webSocketDebuggerUrl": "ws://test"}), \
+                        patch.object(app.websocket, "create_connection"), patch.object(app, "RawCDP"), \
+                        patch.object(app, "navigate"), patch.object(app, "require_login"), patch.object(app, "close_task_tab"), \
+                        patch.object(app, "collect_list", return_value="max_scrolls_reached") as collect:
+                    self.assertEqual(app.main(), 1)
+                self.assertEqual(collect.call_args.args[-2], expected)
+                saved = json.loads(next((folder / "runs").glob("*/jobs.json")).read_text(encoding="utf-8"))
+                self.assertEqual(saved["list_scroll_limit"], expected)
+                self.assertEqual(saved["list_scroll_budget_mode"], mode)
+
     def test_restore_fallback_ids_across_keywords_and_partial_runs(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
