@@ -4,12 +4,13 @@ import argparse
 import base64
 import json
 import re
+import sqlite3
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from html import unescape
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from urllib.parse import parse_qs, urljoin, urlsplit
 from urllib.request import ProxyHandler, build_opener
 
@@ -21,6 +22,8 @@ from turn_csv import export_csv
 from runtime_check import check_ocr_runtime
 from description_ocr import CapturedDescription, DescriptionOCRWorker, capture_description
 from search_regions import CITY_CODES, DISTRICTS, search_url, selected_districts
+from district_progress import DistrictProgress
+from job_db import turn_db
 
 from extract_first_job import CardParser, needs_ocr
 from inspect_cdp import OUTPUT, PORT, PROFILE, build_command, ensure_port_free, find_edge, wait_for_cdp
@@ -497,7 +500,9 @@ def collect_list(cdp, payload, folder, path, list_url, no_prompt, max_scrolls, e
         update_report(payload)
         save_jobs(path, payload)
 
-    while len(payload["jobs"]) < payload["requested_count"]:
+    finish_district = district is not None and payload.get("finish_district", False)
+    empty_rounds = payload.get("empty_rounds", 3)
+    while finish_district or len(payload["jobs"]) < payload["requested_count"]:
         try:
             nodes = wait_cards(cdp)
         except LoginRequired:
@@ -506,16 +511,16 @@ def collect_list(cdp, payload, folder, path, list_url, no_prompt, max_scrolls, e
         before = len(payload["jobs"])
         observed_before = len(observed)
         read_list(cdp, nodes, folder, skip_keys=seen,
-                  limit=payload["requested_count"] - before,
+                  limit=None if finish_district else payload["requested_count"] - before,
                   engine_state=engine_state, on_job=save_one, observed_keys=observed)
         history_observed.update(observed & excluded_keys)
         payload["historical_skipped_count"] = len(history_observed)
         save_jobs(path, payload)
-        if len(payload["jobs"]) >= payload["requested_count"]:
+        if not finish_district and len(payload["jobs"]) >= payload["requested_count"]:
             return "requested_limit_reached"
         # 前几屏可能全是历史岗位；只要看到了不同的岗位标识，就继续向后加载。
         unchanged = unchanged + 1 if len(observed) == observed_before else 0
-        if unchanged >= 3:
+        if unchanged >= empty_rounds:
             return "no_new_results_after_scroll"
         if scrolls >= max_scrolls:
             return "max_scrolls_reached"
@@ -553,7 +558,8 @@ def wait_search_scope(cdp, city, keyword, district, timeout=12):
     raise TimeoutError(f"未确认搜索范围为 {city}·{district}，未读取可能属于其他区的岗位。")
 
 
-def collect_districts(cdp, payload, folder, path, names, no_prompt, max_scrolls, excluded_keys):
+def collect_districts(cdp, payload, folder, path, names, no_prompt, max_scrolls, excluded_keys,
+                      progress=None, after_district=None):
     shared_state = {}
     payload["district_runs"] = []
     payload["list_scroll_count"] = 0
@@ -564,6 +570,8 @@ def collect_districts(cdp, payload, folder, path, names, no_prompt, max_scrolls,
         summary = {"district": district, "code": DISTRICTS[payload["city"]][district],
                    "url": url, "status": "running"}
         payload["district_runs"].append(summary)
+        if progress is not None:
+            progress.save(district)
         before, scrolls_before = len(payload["jobs"]), payload["list_scroll_count"]
         print(f"分区 {number}/{len(names)}：{payload['city']}·{district}，"
               f"本轮合计 {before}/{payload['requested_count']} 条。", flush=True)
@@ -576,6 +584,8 @@ def collect_districts(cdp, payload, folder, path, names, no_prompt, max_scrolls,
                 district=district, shared_state=shared_state
             )
             summary["status"] = "finished"
+            if after_district is not None:
+                after_district()
         except AccessGate as exc:
             summary.update(status="blocked", error=str(exc))
             raise
@@ -590,6 +600,9 @@ def collect_districts(cdp, payload, folder, path, names, no_prompt, max_scrolls,
                            scroll_count=payload["list_scroll_count"] - scrolls_before)
             update_report(payload)
             save_jobs(path, payload)
+        if payload.get("finish_district") and summary.get("stop_reason") == "max_scrolls_reached":
+            print(f"  {district} 已达到滚动安全上限，本轮先停在此区，下次仍从这里开始。", flush=True)
+            return "district_scroll_budget_reached"
         if number < len(names) and len(payload["jobs"]) < payload["requested_count"]:
             time.sleep(2)
     if len(payload["jobs"]) >= payload["requested_count"]:
@@ -603,6 +616,7 @@ def collect_details(cdp, payload, folder, path, no_prompt=False, max_pending=2):
         raise ValueError("OCR 待处理上限必须至少为 1。")
     started = time.perf_counter()
     pending = []
+    jobs = [job for job in payload["jobs"] if job["description_status"] == "pending"]
 
     def persist():
         update_report(payload)
@@ -631,7 +645,7 @@ def collect_details(cdp, payload, folder, path, no_prompt=False, max_pending=2):
     worker = DescriptionOCRWorker()
     with ThreadPoolExecutor(max_workers=1, thread_name_prefix="jd-ocr") as executor:
         try:
-            for index, job in enumerate(payload["jobs"], start=1):
+            for index, job in enumerate(jobs, start=1):
                 for item in pending[:]:
                     if item[1].done():
                         finish(item)
@@ -640,7 +654,7 @@ def collect_details(cdp, payload, folder, path, no_prompt=False, max_pending=2):
                 while len(pending) >= max_pending:
                     finish(pending[0])
                     pending.pop(0)
-                print(f"详情 {index}/{len(payload['jobs'])}：{job['title']}", flush=True)
+                print(f"详情 {index}/{len(jobs)}：{job['title']}", flush=True)
                 page_started = time.perf_counter()
                 try:
                     result = read_description_with_login(cdp, job, folder, no_prompt, capture_only=True)
@@ -663,7 +677,7 @@ def collect_details(cdp, payload, folder, path, no_prompt=False, max_pending=2):
                 finally:
                     job["description_page_seconds"] = time.perf_counter() - page_started
                     persist()
-                if index < len(payload["jobs"]):
+                if index < len(jobs):
                     # 保持原有页面访问间隔；工作器可以利用这段时间识别。
                     time.sleep(2)
         finally:
@@ -678,17 +692,43 @@ def collect_details(cdp, payload, folder, path, no_prompt=False, max_pending=2):
                     interrupted = True
                     print("正在保存已截图岗位的 OCR 结果，请等待本地识别完成……", flush=True)
                     finish(item)
-            payload["detail_pipeline_seconds"] = time.perf_counter() - started
+            payload["detail_pipeline_seconds"] = payload.get("detail_pipeline_seconds", 0) + time.perf_counter() - started
             persist()
             if interrupted:
                 raise KeyboardInterrupt()
+
+
+def import_collected_jobs(path, payload, database):
+    """入库失败保留 JSON，允许下一次回调或结束时重试。"""
+    save_jobs(path, payload)
+    try:
+        report = turn_db(path, database)
+        payload["database"] = {"path": str(database), "status": "ok",
+                               "processed": report["processed"], "total": report["total"]}
+        print(f"数据库已更新：{database}，本轮 {report['processed']} 条，库内共 {report['total']} 条。", flush=True)
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        payload["database"] = {"path": str(database), "status": "error", "error": str(exc)}
+        print(f"自动入库失败，JSON 已保留，可稍后重试：{exc}", flush=True)
+    save_jobs(path, payload)
+
+
+def collection_complete(payload):
+    target_met = payload["fully_extracted_count"] >= payload["requested_count"]
+    exhausted = payload.get("list_stop_reason") == "districts_exhausted"
+    bounded = payload.get("list_stop_reason") == "district_scroll_budget_reached"
+    district_errors = any(row.get("status") != "finished" for row in payload.get("district_runs", []))
+    return not bounded and not district_errors and (target_met or exhausted) and payload["fully_extracted_count"] == len(payload["jobs"])
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--keyword", default="Python")
     parser.add_argument("--city", choices=CITY_CODES, default="广州")
-    parser.add_argument("--limit", type=int, choices=range(1, 101), default=3, metavar="1-100")
+    parser.add_argument("--limit", type=int, default=1000, help="默认目标 1000 条；分区模式完成当前区后再判断是否停止")
+    parser.add_argument("--hard-limit", action="store_true", help="严格达到 limit 即停止，允许中途截断当前区")
+    parser.add_argument("--empty-rounds", type=int, default=3, help="连续多少轮未看到不同岗位时结束该区，默认 3")
+    parser.add_argument("--restart-districts", action="store_true", help="忽略续采位置，从指定分区范围的第一个区开始")
+    parser.add_argument("--db", type=Path, help="自动入库的 SQLite 文件，默认 output/jobs.db")
     parser.add_argument("--max-scrolls", type=int, help="最多滚动加载次数；默认按当前城市历史岗位数自动增加")
     parser.add_argument("--no-prompt", action="store_true", help="未确认登录时直接退出，不采集游客数据")
     parser.add_argument("--include-seen", action="store_true", help="允许再次采集历史岗位，用于复测")
@@ -699,6 +739,8 @@ def main():
     args = parser.parse_args()
     if args.max_scrolls is not None and args.max_scrolls < 0:
         parser.error("--max-scrolls 不能小于 0")
+    if args.limit < 1 or args.empty_rounds < 1:
+        parser.error("--limit 和 --empty-rounds 必须大于 0")
     try:
         districts = [] if args.citywide else selected_districts(args.city, args.district)
     except ValueError as exc:
@@ -714,9 +756,20 @@ def main():
         parser.error(str(exc))
     print(f"{'允许重复采集' if args.include_seen else '跨批次去重'}："
           f"读取 {args.city} 的 {history_files} 份历史结果，按名称与公司排除 {len(excluded_keys)} 个岗位。", flush=True)
+    progress = None
+    if districts:
+        try:
+            progress = DistrictProgress(OUTPUT / "district-progress.json", args.city, args.keyword, districts)
+            districts = progress.order(districts, restart=args.restart_districts)
+        except (OSError, ValueError, TypeError) as exc:
+            parser.error(f"读取分区进度失败：{exc}")
+        print(f"从 {districts[0]} 开始；{'严格按条数停止' if args.hard_limit else '先完成当前区，再判断是否达到本轮目标'}。", flush=True)
+    database = (args.db if args.db is not None else OUTPUT / "jobs.db").resolve()
     max_scrolls = list_scroll_budget(len(excluded_keys), args.max_scrolls)
+    if districts and args.max_scrolls is None:
+        max_scrolls = max(60, max_scrolls)
     print(f"{'每区' if districts else '列表'}滚动上限：{max_scrolls} 次（{'手动指定' if args.max_scrolls is not None else '按历史数量自动估算'}）；"
-          "连续三轮未看到不同岗位时提前结束。", flush=True)
+          f"连续 {args.empty_rounds} 轮未看到不同岗位时结束当前列表。", flush=True)
     ensure_browser()
     folder = OUTPUT / "runs" / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     folder.mkdir(parents=True)
@@ -731,13 +784,19 @@ def main():
                "history_file_count": history_files, "historical_job_count": len(excluded_keys),
                "historical_skipped_count": 0, "list_scroll_limit": max_scrolls,
                "list_scroll_budget_mode": "manual" if args.max_scrolls is not None else "automatic",
-               "search_mode": "districts" if districts else "citywide", "districts": districts}
+               "search_mode": "districts" if districts else "citywide", "districts": districts,
+               "finish_district": bool(districts) and not args.hard_limit, "empty_rounds": args.empty_rounds}
     try:
         cdp = RawCDP(connection)
         cdp.call("Page.enable")
+        def after_district():
+            collect_details(cdp, payload, folder, path, args.no_prompt)
+            import_collected_jobs(path, payload, database)
+
         if districts:
             payload["list_stop_reason"] = collect_districts(
-                cdp, payload, folder, path, districts, args.no_prompt, max_scrolls, excluded_keys
+                cdp, payload, folder, path, districts, args.no_prompt, max_scrolls, excluded_keys,
+                progress=progress, after_district=after_district
             )
         else:
             list_url = search_url(args.city, args.keyword)
@@ -754,7 +813,7 @@ def main():
         save_jobs(path, payload)
         collect_details(cdp, payload, folder, path, args.no_prompt)
         update_report(payload)
-        payload["status"] = "complete" if payload["fully_extracted_count"] == args.limit else "partial"
+        payload["status"] = "complete" if collection_complete(payload) else "partial"
     except (KeyboardInterrupt, ImportError, RuntimeError, ValueError, OSError, websocket.WebSocketException) as exc:
         payload.update(status="stopped", error=str(exc) or "用户中断采集。")
         print("本轮停止：", exc, flush=True)
@@ -765,6 +824,7 @@ def main():
                            description_error=payload.get("error", "本轮尚未处理到此岗位。"))
         update_report(payload)
         save_jobs(path, payload)
+        import_collected_jobs(path, payload, database)
         connection.close()
         if args.close_tab:
             try:
@@ -783,7 +843,7 @@ def main():
         print(f"表格导出失败，JSON 已保留：{exc}", flush=True)
     print(f"请求 {args.limit} 条，列表 {payload['collected_count']} 条，"
           f"薪资成功 {payload['salary_success_count']} 条，详情成功 {payload['description_success_count']} 条。")
-    return 0 if payload["status"] == "complete" and csv_ok else 1
+    return 0 if payload["status"] == "complete" and csv_ok and payload["database"]["status"] == "ok" else 1
 
 
 if __name__ == "__main__":

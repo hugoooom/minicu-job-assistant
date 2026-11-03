@@ -81,13 +81,16 @@ class DistrictTests(unittest.TestCase):
                         patch.object(app.websocket, "create_connection"), patch.object(app, "RawCDP"), \
                         patch.object(app, "collect_districts", return_value="districts_exhausted") as collect, \
                         patch.object(app, "close_task_tab") as close:
-                    self.assertEqual(app.main(), 1)
+                    self.assertEqual(app.main(), 0)
                 self.assertEqual(collect.call_args.args[4], expected)
                 tab.assert_called_once_with()
                 close.assert_not_called()
                 saved = json.loads(next((folder / "runs").glob("*/jobs.json")).read_text(encoding="utf-8"))
                 self.assertEqual(saved["search_mode"], "districts")
                 self.assertEqual(saved["districts"], expected)
+                self.assertEqual(saved["requested_count"], 1000)
+                self.assertTrue(saved["finish_district"])
+                self.assertEqual(saved["database"]["status"], "ok")
 
     def test_scope_requires_matching_url_and_visible_city_and_district(self):
         for correct_url, city, district, success in [

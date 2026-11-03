@@ -4,7 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
-from collect_jobs import save_jobs, update_report
+from collect_jobs import collection_complete, save_jobs, update_report
 from description_ocr import CapturedDescription, DescriptionOCRWorker
 from runtime_check import check_ocr_runtime
 from turn_csv import export_csv
@@ -31,7 +31,7 @@ def retry_saved_descriptions(path, job_id=None):
         except Exception as exc:
             job.update(description_status="error", description_error=f"本地 OCR 重试失败：{exc}")
         update_report(payload)
-        payload["status"] = "complete" if payload["fully_extracted_count"] == payload["requested_count"] else "partial"
+        payload["status"] = "complete" if collection_complete(payload) else "partial"
         save_jobs(path, payload)
     return payload
 
