@@ -110,7 +110,7 @@ def load_rows(files):
                 identity = json.dumps(job_identity(job), ensure_ascii=False)
                 salary = text_or_none(job.get("salary"))
                 salary_status = text_or_none(job.get("salary_status")) or ("ok" if salary else "missing")
-                if salary_status != "ok":
+                if salary_status not in ("ok", "negotiable"):
                     salary = None
                 description = text_or_none(job.get("description"))
                 description_status = text_or_none(job.get("description_status")) or "missing"

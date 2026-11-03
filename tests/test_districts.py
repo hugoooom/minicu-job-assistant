@@ -88,7 +88,7 @@ class DistrictTests(unittest.TestCase):
                 saved = json.loads(next((folder / "runs").glob("*/jobs.json")).read_text(encoding="utf-8"))
                 self.assertEqual(saved["search_mode"], "districts")
                 self.assertEqual(saved["districts"], expected)
-                self.assertEqual(saved["requested_count"], 1000)
+                self.assertEqual(saved["requested_count"], 200)
                 self.assertTrue(saved["finish_district"])
                 self.assertEqual(saved["database"]["status"], "ok")
 

@@ -96,6 +96,12 @@ class SQLiteImportTests(unittest.TestCase):
                                 self.job(id="two", title=None, company=None)])
         self.assertEqual(turn_db(path, self.db)["total"], 2)
 
+    def test_negotiable_salary_is_preserved_instead_of_becoming_null(self):
+        path = self.batch("negotiable", [self.job(salary="面议", salary_status="negotiable")])
+        turn_db(path, self.db)
+        self.assertEqual(self.rows()[0]["salary"], "面议")
+        self.assertEqual(self.rows()[0]["salary_status"], "negotiable")
+
     def test_directory_import_and_empty_batch(self):
         self.batch("a", [self.job()])
         self.batch("b", [])

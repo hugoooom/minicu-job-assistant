@@ -3,6 +3,7 @@
 import argparse
 import base64
 import json
+import hashlib
 import re
 import sqlite3
 import subprocess
@@ -24,6 +25,7 @@ from description_ocr import CapturedDescription, DescriptionOCRWorker, capture_d
 from search_regions import CITY_CODES, DISTRICTS, search_url, selected_districts
 from district_progress import DistrictProgress
 from job_db import turn_db
+from history_repairs import load_missing_jobs, missing_fields, valid_job_url
 
 from extract_first_job import CardParser, needs_ocr
 from inspect_cdp import OUTPUT, PORT, PROFILE, build_command, ensure_port_free, find_edge, wait_for_cdp
@@ -340,8 +342,9 @@ def read_list(cdp, nodes, folder, skip_keys=None, limit=None, engine_state=None,
     return jobs
 
 
-def read_description(cdp, job, folder, timeout=20, capture_only=False):
-    navigate(cdp, job["url"])
+def read_description(cdp, job, folder, timeout=20, capture_only=False, navigate_page=True):
+    if navigate_page:
+        navigate(cdp, job["url"])
     deadline = time.monotonic() + timeout
     candidate, candidate_since = None, None
     last_reason = "页面尚未就绪"
@@ -439,12 +442,12 @@ def save_jobs(path, payload):
     temporary.replace(path)
 
 
-def read_description_with_login(cdp, job, folder, no_prompt=False, capture_only=False):
+def read_description_with_login(cdp, job, folder, no_prompt=False, capture_only=False, navigate_page=True):
     try:
-        return read_description(cdp, job, folder, capture_only=capture_only)
+        return read_description(cdp, job, folder, capture_only=capture_only, navigate_page=navigate_page)
     except LoginRequired:
         require_login(cdp, job["url"], no_prompt=no_prompt)
-        return read_description(cdp, job, folder, capture_only=capture_only)
+        return read_description(cdp, job, folder, capture_only=capture_only, navigate_page=navigate_page)
 
 
 def scroll_list(cdp, nodes):
@@ -698,6 +701,124 @@ def collect_details(cdp, payload, folder, path, no_prompt=False, max_pending=2):
                 raise KeyboardInterrupt()
 
 
+def read_detail_salary(cdp, job, folder, engine_state, timeout=15):
+    """从已有详情 URL 补薪资；只截取薪资节点，并确认登录及目标 URL。"""
+    navigate(cdp, job["url"])
+    deadline = time.monotonic() + timeout
+    last_reason = "尚未出现可见薪资"
+    while time.monotonic() < deadline:
+        try:
+            root = document(cdp)
+            data = snapshot(cdp)
+            page_text = rendered_text(data)
+            check_gate(page_text)
+            if urlsplit(root.get("documentURL", "")).path == urlsplit(job["url"]).path:
+                if authentication_state(cdp, root, page_text) != "authenticated":
+                    raise LoginRequired("历史岗位详情未确认登录，不能读取游客预览薪资。")
+                node = query(cdp, root["nodeId"], ".job-banner .salary, .info-primary .salary")
+                if node:
+                    backend = cdp.call("DOM.describeNode", {"nodeId": node})["node"]["backendNodeId"]
+                    raw = rendered_text(data, backend).strip()
+                    source, scores = "DOM", None
+                    observed = raw
+                    if needs_ocr(raw):
+                        image = folder / f"{job['id']}-salary-retry.png"
+                        salary_screenshot(cdp, node, image)
+                        if engine_state[0] is None:
+                            engine_state[0] = RapidOCR(params={"Global.log_level": "warning"})
+                        result = engine_state[0](str(image), use_det=False, use_cls=False, use_rec=True)
+                        if not result.txts:
+                            raise ValueError("历史岗位薪资 OCR 为空，截图已保存。")
+                        observed, source = " ".join(result.txts), "OCR"
+                        scores = [float(score) for score in result.scores]
+                    fields = normalize_salary(observed, raw)
+                    if fields["salary_status"] not in ("ok", "negotiable"):
+                        raise ValueError("历史岗位薪资仍缺少可确认的单位，未覆盖原值。")
+                    if urlsplit(document(cdp).get("documentURL", "")).path != urlsplit(job["url"]).path:
+                        raise ValueError("薪资识别期间页面已跳转，未保存结果。")
+                    fields["salary_source"] = source
+                    if scores is not None:
+                        fields["salary_ocr_scores"] = scores
+                    return fields
+        except AccessGate:
+            raise
+        except RuntimeError as exc:
+            # 页面刚加载时节点会重建；重新定位，不能把一次失效当作永久失败。
+            last_reason = str(exc)
+        time.sleep(0.4)
+    raise TimeoutError(f"历史岗位 URL 未就绪或没有可见薪资，可能已下架或发生跳转：{last_reason}")
+
+
+def repair_missing_history(cdp, groups, payload, folder, path, database, no_prompt=False):
+    """修复单独记账，不加入本轮新增 jobs；每个缺失字段每轮重试一次。"""
+    report = {"requested": sum(len(jobs) for jobs in groups.values()), "attempted": 0,
+              "repaired": 0, "failed": 0, "skipped": 0, "files": [], "database_errors": []}
+    payload["history_repair"] = report
+    engine_state = [None]
+    for keyword, jobs in groups.items():
+        group_folder = folder / "repairs" / hashlib.sha256(keyword.encode("utf-8")).hexdigest()[:16]
+        group_folder.mkdir(parents=True, exist_ok=True)
+        group_path = group_folder / "jobs.json"
+        report["files"].append(str(group_path.relative_to(folder)))
+        batch = {"city": payload["city"], "keyword": keyword, "kind": "history_repair",
+                 "requested_count": len(jobs), "jobs": jobs, "status": "running"}
+        try:
+            for job in jobs:
+                if not valid_job_url(job.get("url")):
+                    job["repair_error"] = "缺少有效的 BOSS 详情 URL，未自动访问。"
+                    report["skipped"] += 1
+                    continue
+                report["attempted"] += 1
+                print(f"历史修复 {report['attempted']}/{report['requested']}：{job.get('title')}", flush=True)
+                page_ready = False
+                try:
+                    if "salary" in missing_fields(job):
+                        try:
+                            try:
+                                fields = read_detail_salary(cdp, job, group_folder, engine_state)
+                            except LoginRequired:
+                                require_login(cdp, job["url"], no_prompt)
+                                fields = read_detail_salary(cdp, job, group_folder, engine_state)
+                            job.update(fields)
+                            job.pop("salary_retry_error", None)
+                            page_ready = True
+                        except AccessGate:
+                            raise
+                        except (RuntimeError, ValueError, OSError, websocket.WebSocketException) as exc:
+                            job["salary_retry_error"] = str(exc)
+                    if "description" in missing_fields(job):
+                        try:
+                            text = read_description_with_login(cdp, job, group_folder, no_prompt,
+                                                               navigate_page=not page_ready)
+                            job.update(description=text, description_status="ok", description_characters=len(text))
+                            job.pop("description_error", None)
+                        except AccessGate:
+                            raise
+                        except (RuntimeError, ValueError, OSError, websocket.WebSocketException) as exc:
+                            job.update(description_status="error", description_error=str(exc))
+                    if not missing_fields(job):
+                        report["repaired"] += 1
+                    else:
+                        report["failed"] += 1
+                finally:
+                    update_report(batch)
+                    save_jobs(group_path, batch)
+                    save_jobs(path, payload)
+                time.sleep(2)
+            batch["status"] = "complete" if all(not missing_fields(j) for j in jobs) else "partial"
+        except BaseException:
+            batch["status"] = "stopped"
+            raise
+        finally:
+            update_report(batch)
+            import_collected_jobs(group_path, batch, database)
+            report["database_status"] = batch["database"]["status"]
+            if batch["database"]["status"] != "ok":
+                report["database_errors"].append({"keyword": keyword, "error": batch["database"]["error"]})
+            save_jobs(path, payload)
+    print(f"历史修复：成功 {report['repaired']}，仍缺失 {report['failed']}，无有效 URL {report['skipped']}。", flush=True)
+
+
 def import_collected_jobs(path, payload, database):
     """入库失败保留 JSON，允许下一次回调或结束时重试。"""
     save_jobs(path, payload)
@@ -724,11 +845,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--keyword", default="Python")
     parser.add_argument("--city", choices=CITY_CODES, default="广州")
-    parser.add_argument("--limit", type=int, default=1000, help="默认目标 1000 条；分区模式完成当前区后再判断是否停止")
+    parser.add_argument("--limit", type=int, default=200, help="默认目标 200 条；分区模式完成当前区后再判断是否停止")
     parser.add_argument("--hard-limit", action="store_true", help="严格达到 limit 即停止，允许中途截断当前区")
     parser.add_argument("--empty-rounds", type=int, default=3, help="连续多少轮未看到不同岗位时结束该区，默认 3")
     parser.add_argument("--restart-districts", action="store_true", help="忽略续采位置，从指定分区范围的第一个区开始")
     parser.add_argument("--db", type=Path, help="自动入库的 SQLite 文件，默认 output/jobs.db")
+    parser.add_argument("--skip-repair", action="store_true", help="本轮跳过数据库中缺失薪资/正文的 URL 重试")
     parser.add_argument("--max-scrolls", type=int, help="最多滚动加载次数；默认按当前城市历史岗位数自动增加")
     parser.add_argument("--no-prompt", action="store_true", help="未确认登录时直接退出，不采集游客数据")
     parser.add_argument("--include-seen", action="store_true", help="允许再次采集历史岗位，用于复测")
@@ -765,6 +887,13 @@ def main():
             parser.error(f"读取分区进度失败：{exc}")
         print(f"从 {districts[0]} 开始；{'严格按条数停止' if args.hard_limit else '先完成当前区，再判断是否达到本轮目标'}。", flush=True)
     database = (args.db if args.db is not None else OUTPUT / "jobs.db").resolve()
+    try:
+        missing_jobs = {} if args.skip_repair else load_missing_jobs(database, args.city)
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        parser.error(f"读取历史修复队列失败：{exc}；可用 --skip-repair 暂时跳过")
+    # 即便旧 JSON 被移动，仅存在数据库的修复对象也不能在本轮重复计入新增。
+    excluded_keys.update(job_identity(job) for jobs in missing_jobs.values() for job in jobs)
+    print(f"待按 URL 修复 {sum(len(jobs) for jobs in missing_jobs.values())} 个历史岗位，不占新增名额。", flush=True)
     max_scrolls = list_scroll_budget(len(excluded_keys), args.max_scrolls)
     if districts and args.max_scrolls is None:
         max_scrolls = max(60, max_scrolls)
@@ -789,6 +918,8 @@ def main():
     try:
         cdp = RawCDP(connection)
         cdp.call("Page.enable")
+        if missing_jobs:
+            repair_missing_history(cdp, missing_jobs, payload, folder, path, database, args.no_prompt)
         def after_district():
             collect_details(cdp, payload, folder, path, args.no_prompt)
             import_collected_jobs(path, payload, database)
