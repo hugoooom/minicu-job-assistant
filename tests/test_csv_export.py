@@ -61,7 +61,7 @@ class CsvExportTests(unittest.TestCase):
                         raise KeyboardInterrupt()
                     return "requested_limit_reached"
 
-                with patch("sys.argv", ["collect_jobs.py", "--limit", "1"] + (["--close-tab"] if close_tab else [])), \
+                with patch("sys.argv", ["collect_jobs.py", "--citywide", "--limit", "1"] + (["--close-tab"] if close_tab else [])), \
                         patch.object(app, "OUTPUT", output), patch.object(app, "check_ocr_runtime"), patch.object(app, "ensure_browser"), \
                         patch.object(app, "open_task_tab", return_value={"id": "task", "webSocketDebuggerUrl": "ws://test"}), \
                         patch.object(app.websocket, "create_connection"), patch.object(app, "RawCDP"), \

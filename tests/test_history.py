@@ -47,7 +47,7 @@ class HistoryTests(unittest.TestCase):
                                       (["--include-seen"], 12, "automatic")):
             with self.subTest(flags=flags), tempfile.TemporaryDirectory() as directory:
                 folder = Path(directory)
-                with patch("sys.argv", ["collect_jobs.py", "--limit", "100"] + flags), \
+                with patch("sys.argv", ["collect_jobs.py", "--citywide", "--limit", "100"] + flags), \
                         patch.object(app, "OUTPUT", folder), patch.object(app, "check_ocr_runtime"), \
                         patch.object(app, "load_history", return_value=({identity(n) for n in range(1, 234)}, 10)), \
                         patch.object(app, "ensure_browser"), patch.object(app, "open_task_tab", return_value={"id": "task", "webSocketDebuggerUrl": "ws://test"}), \
@@ -115,7 +115,7 @@ class HistoryTests(unittest.TestCase):
                 app.save_jobs(old / "jobs.json", {"city": "广州", "jobs": [
                     {"id": "old", "title": "岗位1", "company": "示例公司"}
                 ]})
-                argv = ["collect_jobs.py", "--limit", "1"] + (["--include-seen"] if include_seen else [])
+                argv = ["collect_jobs.py", "--citywide", "--limit", "1"] + (["--include-seen"] if include_seen else [])
                 with patch("sys.argv", argv), patch.object(app, "OUTPUT", output), \
                         patch.object(app, "check_ocr_runtime"), patch.object(app, "ensure_browser"), patch.object(app, "open_task_tab", return_value={
                             "id": "task", "webSocketDebuggerUrl": "ws://test"}), \

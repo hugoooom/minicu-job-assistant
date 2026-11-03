@@ -3,12 +3,14 @@
 import argparse
 import base64
 import json
+import re
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from html import unescape
 from pathlib import PurePosixPath
-from urllib.parse import urlencode, urljoin, urlsplit
+from urllib.parse import parse_qs, urljoin, urlsplit
 from urllib.request import ProxyHandler, build_opener
 
 import websocket
@@ -18,6 +20,7 @@ from job_history import job_identity, load_history
 from turn_csv import export_csv
 from runtime_check import check_ocr_runtime
 from description_ocr import CapturedDescription, DescriptionOCRWorker, capture_description
+from search_regions import CITY_CODES, DISTRICTS, search_url, selected_districts
 
 from extract_first_job import CardParser, needs_ocr
 from inspect_cdp import OUTPUT, PORT, PROFILE, build_command, ensure_port_free, find_edge, wait_for_cdp
@@ -25,7 +28,6 @@ from inspect_raw_cdp import RawCDP, list_pages
 
 
 STYLE_NAMES = ["display", "visibility", "opacity", "font-size"]
-CITY_CODES = {"广州": "101280100", "深圳": "101280600"}
 
 
 class AccessGate(RuntimeError):
@@ -475,14 +477,21 @@ def list_scroll_budget(historical_count, explicit_limit=None):
     return 12 + (historical_count + 14) // 15
 
 
-def collect_list(cdp, payload, folder, path, list_url, no_prompt, max_scrolls, excluded_keys=None):
+def collect_list(cdp, payload, folder, path, list_url, no_prompt, max_scrolls, excluded_keys=None,
+                 district=None, shared_state=None):
     excluded_keys = set(excluded_keys or ())
     seen = excluded_keys | {job_identity(job) for job in payload["jobs"]}
-    observed, engine_state, unchanged, scrolls = set(), [None], 0, 0
+    shared_state = shared_state if shared_state is not None else {}
+    observed, unchanged, scrolls = set(), 0, 0
+    engine_state = shared_state.setdefault("engine_state", [None])
+    history_observed = shared_state.setdefault("history_observed", set())
+    previous_scrolls = payload.get("list_scroll_count", 0)
     payload["list_scroll_limit"] = max_scrolls
-    payload["list_scroll_count"] = 0
+    payload["list_scroll_count"] = previous_scrolls
 
     def save_one(job):
+        if district is not None:
+            job.update(search_district=district, search_district_code=DISTRICTS[payload["city"]][district])
         payload["jobs"].append(job)
         seen.add(job_identity(job))
         update_report(payload)
@@ -499,7 +508,8 @@ def collect_list(cdp, payload, folder, path, list_url, no_prompt, max_scrolls, e
         read_list(cdp, nodes, folder, skip_keys=seen,
                   limit=payload["requested_count"] - before,
                   engine_state=engine_state, on_job=save_one, observed_keys=observed)
-        payload["historical_skipped_count"] = len(observed & excluded_keys)
+        history_observed.update(observed & excluded_keys)
+        payload["historical_skipped_count"] = len(history_observed)
         save_jobs(path, payload)
         if len(payload["jobs"]) >= payload["requested_count"]:
             return "requested_limit_reached"
@@ -513,9 +523,78 @@ def collect_list(cdp, payload, folder, path, list_url, no_prompt, max_scrolls, e
               f"已跳过 {payload['historical_skipped_count']} 个历史岗位，继续加载列表……", flush=True)
         scroll_list(cdp, nodes)
         scrolls += 1
-        payload["list_scroll_count"] = scrolls
+        payload["list_scroll_count"] = previous_scrolls + scrolls
         time.sleep(1)
     return "requested_limit_reached"
+
+
+def wait_search_scope(cdp, city, keyword, district, timeout=12):
+    """防止跳转/旧列表被错误登记到另一个城市或区。"""
+    expected = parse_qs(urlsplit(search_url(city, keyword, district)).query)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            root = document(cdp)
+            actual = parse_qs(urlsplit(root.get("documentURL", "")).query)
+            if all(actual.get(key) == value for key, value in expected.items()):
+                city_id = query(cdp, root["nodeId"], ".cur-city-label")
+                area_id = query(cdp, root["nodeId"], '[ka^="sel-business-"].active')
+                # 标签文本可以含嵌套元素；用现有 HTMLParser 去掉标签。
+                city_text = unescape(re.sub("<[^>]+>", "", outer_html(cdp, city_id))) if city_id else ""
+                area_text = unescape(re.sub("<[^>]+>", "", outer_html(cdp, area_id))) if area_id else ""
+                if city_text.strip() == city and district in area_text and "(全)" in area_text:
+                    return
+            check_gate(rendered_text(snapshot(cdp)))
+        except AccessGate:
+            raise
+        except RuntimeError:
+            pass
+        time.sleep(0.4)
+    raise TimeoutError(f"未确认搜索范围为 {city}·{district}，未读取可能属于其他区的岗位。")
+
+
+def collect_districts(cdp, payload, folder, path, names, no_prompt, max_scrolls, excluded_keys):
+    shared_state = {}
+    payload["district_runs"] = []
+    payload["list_scroll_count"] = 0
+    for number, district in enumerate(names, start=1):
+        if len(payload["jobs"]) >= payload["requested_count"]:
+            return "requested_limit_reached"
+        url = search_url(payload["city"], payload["keyword"], district)
+        summary = {"district": district, "code": DISTRICTS[payload["city"]][district],
+                   "url": url, "status": "running"}
+        payload["district_runs"].append(summary)
+        before, scrolls_before = len(payload["jobs"]), payload["list_scroll_count"]
+        print(f"分区 {number}/{len(names)}：{payload['city']}·{district}，"
+              f"本轮合计 {before}/{payload['requested_count']} 条。", flush=True)
+        try:
+            navigate(cdp, url)
+            require_login(cdp, url, no_prompt)
+            wait_search_scope(cdp, payload["city"], payload["keyword"], district)
+            summary["stop_reason"] = collect_list(
+                cdp, payload, folder, path, url, no_prompt, max_scrolls, excluded_keys,
+                district=district, shared_state=shared_state
+            )
+            summary["status"] = "finished"
+        except AccessGate as exc:
+            summary.update(status="blocked", error=str(exc))
+            raise
+        except TimeoutError as exc:
+            summary.update(status="error", error=str(exc), stop_reason="district_not_ready")
+            print(f"  {district} 页面未就绪，记录错误并尝试下一个区：{exc}", flush=True)
+        except BaseException as exc:
+            summary.update(status="interrupted", error=str(exc) or type(exc).__name__)
+            raise
+        finally:
+            summary.update(collected_count=len(payload["jobs"]) - before,
+                           scroll_count=payload["list_scroll_count"] - scrolls_before)
+            update_report(payload)
+            save_jobs(path, payload)
+        if number < len(names) and len(payload["jobs"]) < payload["requested_count"]:
+            time.sleep(2)
+    if len(payload["jobs"]) >= payload["requested_count"]:
+        return "requested_limit_reached"
+    return "districts_finished_with_errors" if any(r["status"] == "error" for r in payload["district_runs"]) else "districts_exhausted"
 
 
 def collect_details(cdp, payload, folder, path, no_prompt=False, max_pending=2):
@@ -614,9 +693,16 @@ def main():
     parser.add_argument("--no-prompt", action="store_true", help="未确认登录时直接退出，不采集游客数据")
     parser.add_argument("--include-seen", action="store_true", help="允许再次采集历史岗位，用于复测")
     parser.add_argument("--close-tab", action="store_true", help="结束时关闭程序创建的任务标签页；默认保留现场")
+    regions = parser.add_mutually_exclusive_group()
+    regions.add_argument("--district", nargs="+", help="仅采集指定区，例如 --district 荔湾区 天河区；默认依次采集全市各区")
+    regions.add_argument("--citywide", action="store_true", help="使用原来的全市单列表模式")
     args = parser.parse_args()
     if args.max_scrolls is not None and args.max_scrolls < 0:
         parser.error("--max-scrolls 不能小于 0")
+    try:
+        districts = [] if args.citywide else selected_districts(args.city, args.district)
+    except ValueError as exc:
+        parser.error(str(exc))
     try:
         check_ocr_runtime()
     except RuntimeError as exc:
@@ -629,7 +715,7 @@ def main():
     print(f"{'允许重复采集' if args.include_seen else '跨批次去重'}："
           f"读取 {args.city} 的 {history_files} 份历史结果，按名称与公司排除 {len(excluded_keys)} 个岗位。", flush=True)
     max_scrolls = list_scroll_budget(len(excluded_keys), args.max_scrolls)
-    print(f"列表滚动上限：{max_scrolls} 次（{'手动指定' if args.max_scrolls is not None else '按历史数量自动估算'}）；"
+    print(f"{'每区' if districts else '列表'}滚动上限：{max_scrolls} 次（{'手动指定' if args.max_scrolls is not None else '按历史数量自动估算'}）；"
           "连续三轮未看到不同岗位时提前结束。", flush=True)
     ensure_browser()
     folder = OUTPUT / "runs" / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
@@ -644,19 +730,23 @@ def main():
                "deduplication_city": args.city,
                "history_file_count": history_files, "historical_job_count": len(excluded_keys),
                "historical_skipped_count": 0, "list_scroll_limit": max_scrolls,
-               "list_scroll_budget_mode": "manual" if args.max_scrolls is not None else "automatic"}
+               "list_scroll_budget_mode": "manual" if args.max_scrolls is not None else "automatic",
+               "search_mode": "districts" if districts else "citywide", "districts": districts}
     try:
         cdp = RawCDP(connection)
         cdp.call("Page.enable")
-        list_url = "https://www.zhipin.com/web/geek/job?" + urlencode({
-            "query": args.keyword, "city": CITY_CODES[args.city]
-        })
-        print("自动打开搜索页……", flush=True)
-        navigate(cdp, list_url)
-        require_login(cdp, list_url, args.no_prompt)
-        payload["list_stop_reason"] = collect_list(
-            cdp, payload, folder, path, list_url, args.no_prompt, max_scrolls, excluded_keys
-        )
+        if districts:
+            payload["list_stop_reason"] = collect_districts(
+                cdp, payload, folder, path, districts, args.no_prompt, max_scrolls, excluded_keys
+            )
+        else:
+            list_url = search_url(args.city, args.keyword)
+            print("自动打开搜索页……", flush=True)
+            navigate(cdp, list_url)
+            require_login(cdp, list_url, args.no_prompt)
+            payload["list_stop_reason"] = collect_list(
+                cdp, payload, folder, path, list_url, args.no_prompt, max_scrolls, excluded_keys
+            )
         print(f"列表取得 {len(payload['jobs'])}/{args.limit} 条，停止原因：{payload['list_stop_reason']}", flush=True)
         if payload["list_stop_reason"] == "max_scrolls_reached":
             print(f"滚动次数已用完；本轮跳过 {payload['historical_skipped_count']} 个历史岗位。"

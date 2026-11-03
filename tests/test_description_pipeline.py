@@ -165,7 +165,7 @@ class DescriptionPipelineTests(unittest.TestCase):
                 self.assertEqual(report["status"], "complete")
                 self.assertEqual([j["description_status"] for j in report["jobs"]], ["ok", "ok"])
                 return path.with_suffix(".csv")
-            with patch("sys.argv", ["collect_jobs.py", "--limit", "2"]), \
+            with patch("sys.argv", ["collect_jobs.py", "--citywide", "--limit", "2"]), \
                     patch.object(app, "OUTPUT", output), patch.object(app, "load_history", return_value=(set(), 0)), \
                     patch.object(app, "check_ocr_runtime"), patch.object(app, "ensure_browser"), \
                     patch.object(app, "open_task_tab", return_value={"id": "task", "webSocketDebuggerUrl": "ws://test"}) as tab, \
