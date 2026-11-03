@@ -208,4 +208,3 @@ GROUP BY city_key, keyword_key;
 - [Chrome DevTools Protocol](https://chromedevtools.github.io/devtools-protocol/)：DOM、DOMSnapshot、Page 等接口。
 - [RapidOCR](https://github.com/RapidAI/RapidOCR)：薪资文字识别。
 
-本项目目前采用 DOM + OCR 路径，未实现参考项目的网络响应采集，也未实现完整 GKD 选择器或 LLM Agent。
