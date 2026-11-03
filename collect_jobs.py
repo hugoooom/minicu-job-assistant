@@ -613,6 +613,7 @@ def main():
     parser.add_argument("--max-scrolls", type=int, help="最多滚动加载次数；默认按当前城市历史岗位数自动增加")
     parser.add_argument("--no-prompt", action="store_true", help="未确认登录时直接退出，不采集游客数据")
     parser.add_argument("--include-seen", action="store_true", help="允许再次采集历史岗位，用于复测")
+    parser.add_argument("--close-tab", action="store_true", help="结束时关闭程序创建的任务标签页；默认保留现场")
     args = parser.parse_args()
     if args.max_scrolls is not None and args.max_scrolls < 0:
         parser.error("--max-scrolls 不能小于 0")
@@ -675,11 +676,14 @@ def main():
         update_report(payload)
         save_jobs(path, payload)
         connection.close()
-        try:
-            print("本轮结束，关闭程序创建的任务标签页。", flush=True)
-            close_task_tab(target["id"])
-        except (OSError, RuntimeError, websocket.WebSocketException):
-            pass
+        if args.close_tab:
+            try:
+                print("本轮结束，关闭程序创建的任务标签页。", flush=True)
+                close_task_tab(target["id"])
+            except (OSError, RuntimeError, websocket.WebSocketException):
+                pass
+        else:
+            print("本轮结束，保留任务标签页，方便检查当前页面。", flush=True)
     print("结果已保存：", path)
     csv_ok = True
     try:

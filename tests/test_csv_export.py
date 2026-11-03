@@ -44,8 +44,10 @@ class CsvExportTests(unittest.TestCase):
             self.assertEqual(json.loads(path.read_text(encoding="utf-8")), {"jobs": []})
 
     def test_collection_exports_final_records_and_preserves_json_on_export_failure(self):
-        for case in ("complete", "stopped", "export_failure", "missing_ocr"):
-            with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
+        for case, close_tab in [(case, close_tab)
+                                for case in ("complete", "stopped", "export_failure", "missing_ocr", "interrupted")
+                                for close_tab in (False, True)]:
+            with self.subTest(case=case, close_tab=close_tab), tempfile.TemporaryDirectory() as directory:
                 output = Path(directory)
 
                 def collect(cdp, payload, *args):
@@ -55,9 +57,11 @@ class CsvExportTests(unittest.TestCase):
                         raise app.AccessGate("访问过于频繁")
                     if case == "missing_ocr":
                         raise ImportError("onnxruntime is not installed.")
+                    if case == "interrupted":
+                        raise KeyboardInterrupt()
                     return "requested_limit_reached"
 
-                with patch("sys.argv", ["collect_jobs.py", "--limit", "1"]), \
+                with patch("sys.argv", ["collect_jobs.py", "--limit", "1"] + (["--close-tab"] if close_tab else [])), \
                         patch.object(app, "OUTPUT", output), patch.object(app, "check_ocr_runtime"), patch.object(app, "ensure_browser"), \
                         patch.object(app, "open_task_tab", return_value={"id": "task", "webSocketDebuggerUrl": "ws://test"}), \
                         patch.object(app.websocket, "create_connection"), patch.object(app, "RawCDP"), \
@@ -68,16 +72,19 @@ class CsvExportTests(unittest.TestCase):
                         patch.object(app, "export_csv", side_effect=PermissionError("Excel 占用") if case == "export_failure" else export_csv):
                     result = app.main()
                 self.assertEqual(result, 0 if case == "complete" else 1)
-                close.assert_called_once_with("task")
+                if close_tab:
+                    close.assert_called_once_with("task")
+                else:
+                    close.assert_not_called()
                 path = next((output / "runs").glob("*/jobs.json"))
                 report = json.loads(path.read_text(encoding="utf-8"))
-                self.assertEqual(report["status"], "stopped" if case in ("stopped", "missing_ocr") else "complete")
+                self.assertEqual(report["status"], "stopped" if case in ("stopped", "missing_ocr", "interrupted") else "complete")
                 if case == "export_failure":
                     self.assertFalse(path.with_suffix(".csv").exists())
                 else:
                     with path.with_suffix(".csv").open(encoding="utf-8-sig", newline="") as f:
                         row = next(csv.DictReader(f))
-                    self.assertEqual(row["description_status"], "not_processed" if case in ("stopped", "missing_ocr") else "ok")
+                    self.assertEqual(row["description_status"], "not_processed" if case in ("stopped", "missing_ocr", "interrupted") else "ok")
 
 
 if __name__ == "__main__":

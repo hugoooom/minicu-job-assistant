@@ -177,7 +177,7 @@ class DescriptionPipelineTests(unittest.TestCase):
                     patch.object(app, "export_csv", side_effect=export), patch.object(app.time, "sleep"):
                 self.assertEqual(app.main(), 0)
             tab.assert_called_once_with()
-            close.assert_called_once_with("task")
+            close.assert_not_called()
 
     def test_first_interrupt_during_final_drain_keeps_result(self):
         from concurrent.futures import Future
