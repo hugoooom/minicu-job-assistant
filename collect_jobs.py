@@ -29,6 +29,7 @@ from history_repairs import load_missing_jobs, missing_fields, valid_job_url
 from job_lifecycle import (JobUnavailable, TERMINAL_MARKERS, delete_unavailable_job,
                            platform_id, terminal_reason)
 from locations import DETAIL_SOURCES, LocationNotProvided, has_detail_location, location_fields
+from repair_policy import RepairPolicy, required_fields, reuse_fields
 
 from extract_first_job import CardParser, needs_ocr
 from inspect_cdp import OUTPUT, PORT, PROFILE, build_command, ensure_port_free, find_edge, wait_for_cdp
@@ -589,7 +590,7 @@ def read_description_with_login(cdp, job, folder, no_prompt=False, capture_only=
         return read_description(cdp, job, folder, capture_only=capture_only, navigate_page=navigate_page)
     except LoginRequired:
         require_login(cdp, job["url"], no_prompt=no_prompt)
-        return read_description(cdp, job, folder, capture_only=capture_only, navigate_page=navigate_page)
+        return read_description(cdp, job, folder, capture_only=capture_only, navigate_page=False)
 
 
 def scroll_list(cdp, nodes):
@@ -843,9 +844,10 @@ def collect_details(cdp, payload, folder, path, no_prompt=False, max_pending=2):
                 raise KeyboardInterrupt()
 
 
-def read_detail_salary(cdp, job, folder, engine_state, timeout=15):
+def read_detail_salary(cdp, job, folder, engine_state, timeout=15, navigate_page=True):
     """从已有详情 URL 补薪资；只截取薪资节点，并确认登录及目标 URL。"""
-    navigate(cdp, job["url"])
+    if navigate_page:
+        navigate(cdp, job["url"])
     deadline = time.monotonic() + timeout
     last_reason = "尚未出现可见薪资"
     while time.monotonic() < deadline:
@@ -907,10 +909,27 @@ def repair_missing_history(cdp, groups, payload, folder, path, database, no_prom
     """修复单独记账，不加入本轮新增 jobs；每个缺失字段每轮重试一次。"""
     report = {"requested": sum(len(jobs) for jobs in groups.values()), "attempted": 0,
               "repaired": 0, "failed": 0, "skipped": 0, "deleted": 0, "unavailable": 0,
-              "files": [], "database_errors": [], "address_not_provided": 0}
+              "files": [], "database_errors": [], "address_not_provided": 0, "reused_urls": 0}
     payload["history_repair"] = report
     engine_state = [None]
     deleted_targets = {}
+    policy = RepairPolicy(database, payload["city"])
+    completed_targets = {}
+    # 同网址在不同关键词组里可能缺不同字段，合并为一次页面读取任务。
+    copies = {}
+    for jobs in groups.values():
+        for job in jobs:
+            target_id = platform_id(job.get("url"))
+            if target_id:
+                copies.setdefault(target_id, []).append(job)
+    for same_url in copies.values():
+        for source in same_url:
+            for target in same_url:
+                reuse_fields(source, target)
+        fields = set().union(*(set(j.get("_repair_fields", required_fields(j))) for j in same_url))
+        same_url[0]["_repair_fields"] = sorted(fields)
+        if "location" in fields:
+            same_url[0]["location_refresh_required"] = True
     for keyword, jobs in groups.items():
         group_folder = folder / "repairs" / hashlib.sha256(keyword.encode("utf-8")).hexdigest()[:16]
         group_folder.mkdir(parents=True, exist_ok=True)
@@ -928,17 +947,25 @@ def repair_missing_history(cdp, groups, payload, folder, path, database, no_prom
                     job["repair_error"] = "缺少有效的 BOSS 详情 URL，未自动访问。"
                     report["skipped"] += 1
                     continue
+                if target_id in completed_targets:
+                    reuse_fields(completed_targets[target_id], job)
+                    report["reused_urls"] += 1
+                    report["repaired" if repair_succeeded(job) else "failed"] += 1
+                    continue
                 report["attempted"] += 1
                 print(f"历史修复 {report['attempted']}/{report['requested']}：{job.get('title')}", flush=True)
                 page_ready = False
                 try:
-                    if "salary" in missing_fields(job):
+                    due_fields = set(job.get("_repair_fields", required_fields(job)))
+                    if "salary" in due_fields and "salary" in missing_fields(job):
+                        policy.record(job, "salary")
+                        page_ready = True  # 已请求该 URL；字段读取失败也复用页面，不重新导航。
                         try:
                             try:
                                 fields = read_detail_salary(cdp, job, group_folder, engine_state)
                             except LoginRequired:
                                 require_login(cdp, job["url"], no_prompt)
-                                fields = read_detail_salary(cdp, job, group_folder, engine_state)
+                                fields = read_detail_salary(cdp, job, group_folder, engine_state, navigate_page=False)
                             job.update(fields)
                             job.pop("salary_retry_error", None)
                             page_ready = True
@@ -948,10 +975,13 @@ def repair_missing_history(cdp, groups, payload, folder, path, database, no_prom
                             raise
                         except (RuntimeError, ValueError, OSError, websocket.WebSocketException) as exc:
                             job["salary_retry_error"] = str(exc)
-                    if "description" in missing_fields(job):
+                    if "description" in due_fields and "description" in missing_fields(job):
+                        policy.record(job, "description")
+                        navigate_page = not page_ready
+                        page_ready = True
                         try:
                             text = read_description_with_login(cdp, job, group_folder, no_prompt,
-                                                               navigate_page=not page_ready)
+                                                               navigate_page=navigate_page)
                             job.update(description=text, description_status="ok", description_characters=len(text))
                             job.pop("description_error", None)
                             page_ready = True
@@ -961,7 +991,8 @@ def repair_missing_history(cdp, groups, payload, folder, path, database, no_prom
                             raise
                         except (RuntimeError, ValueError, OSError, websocket.WebSocketException) as exc:
                             job.update(description_status="error", description_error=str(exc))
-                    if job.get("location_refresh_required") and not has_detail_location(job):
+                    if "location" in due_fields and job.get("location_refresh_required") and not has_detail_location(job):
+                        policy.record(job, "location")
                         try:
                             try:
                                 fields = read_detail_location(cdp, job, group_folder, engine_state, navigate_page=not page_ready)
@@ -973,6 +1004,7 @@ def repair_missing_history(cdp, groups, payload, folder, path, database, no_prom
                         except (AccessGate, JobUnavailable):
                             raise
                         except LocationNotProvided as exc:
+                            policy.record(job, "location", "not_provided")
                             job.update(location_status="not_provided", location_error=str(exc))
                             report["address_not_provided"] += 1
                             print(f"  {exc}", flush=True)
@@ -995,6 +1027,10 @@ def repair_missing_history(cdp, groups, payload, folder, path, database, no_prom
                         report["failed"] += 1
                         print(job["repair_error"], flush=True)
                 finally:
+                    completed_targets[target_id] = dict(job)
+                    for field in ("salary", "description", "location"):
+                        if (field == "location" and has_detail_location(job)) or (field != "location" and field not in missing_fields(job)):
+                            policy.record(job, field, "ok")
                     update_report(batch)
                     save_jobs(group_path, batch)
                     save_jobs(path, payload)
@@ -1045,6 +1081,7 @@ def main():
     parser.add_argument("--restart-districts", action="store_true", help="忽略续采位置，从指定分区范围的第一个区开始")
     parser.add_argument("--db", type=Path, help="自动入库的 SQLite 文件，默认 output/jobs.db")
     parser.add_argument("--skip-repair", action="store_true", help="本轮跳过数据库中缺失薪资/正文的 URL 重试")
+    parser.add_argument("--repair-limit", type=int, default=30, help="每轮历史补采最多访问 30 个不同岗位 URL，余下留给后续运行")
     parser.add_argument("--update-locations", action="store_true", help="补采所选城市数据库中的详情工作地址，本轮不采新列表")
     parser.add_argument("--max-scrolls", type=int, help="最多滚动加载次数；默认按当前城市历史岗位数自动增加")
     parser.add_argument("--no-prompt", action="store_true", help="未确认登录时直接退出，不采集游客数据")
@@ -1056,8 +1093,8 @@ def main():
     args = parser.parse_args()
     if args.max_scrolls is not None and args.max_scrolls < 0:
         parser.error("--max-scrolls 不能小于 0")
-    if args.limit < 1 or args.empty_rounds < 1:
-        parser.error("--limit 和 --empty-rounds 必须大于 0")
+    if args.limit < 1 or args.empty_rounds < 1 or args.repair_limit < 1:
+        parser.error("--limit、--empty-rounds 和 --repair-limit 必须大于 0")
     if args.update_locations and args.skip_repair:
         parser.error("--update-locations 不能与 --skip-repair 同时使用")
     try:
@@ -1090,7 +1127,17 @@ def main():
         parser.error(f"读取历史修复队列失败：{exc}；可用 --skip-repair 暂时跳过")
     # 即便旧 JSON 被移动，仅存在数据库的修复对象也不能在本轮重复计入新增。
     excluded_keys.update(job_identity(job) for jobs in missing_jobs.values() for job in jobs)
+    schedule = {"cooldown_deferred": 0, "budget_deferred": 0, "unique_urls": 0}
+    if missing_jobs:
+        try:
+            missing_jobs, schedule = RepairPolicy(database, args.city).select(missing_jobs, args.repair_limit)
+        except (OSError, sqlite3.Error) as exc:
+            parser.error(f"读取补采重试记录失败：{exc}；未继续网页访问")
     print(f"待按 URL 修复 {sum(len(jobs) for jobs in missing_jobs.values())} 个历史岗位，不占新增名额。", flush=True)
+    print(f"补采预算 {args.repair_limit} 个网址；冷却暂缓 {schedule['cooldown_deferred']} 条，预算暂缓 {schedule['budget_deferred']} 条。", flush=True)
+    if args.update_locations and not missing_jobs:
+        print("本次没有到期的地址补采任务，未打开浏览器或访问网页。", flush=True)
+        return 0
     max_scrolls = list_scroll_budget(len(excluded_keys), args.max_scrolls)
     if districts and args.max_scrolls is None:
         max_scrolls = max(60, max_scrolls)
@@ -1111,6 +1158,7 @@ def main():
                "historical_skipped_count": 0, "list_scroll_limit": max_scrolls,
                "list_scroll_budget_mode": "manual" if args.max_scrolls is not None else "automatic",
                "search_mode": "location_backfill" if args.update_locations else ("districts" if districts else "citywide"), "districts": districts,
+               "repair_schedule": schedule,
                "finish_district": bool(districts) and not args.hard_limit, "empty_rounds": args.empty_rounds}
     try:
         cdp = RawCDP(connection)
@@ -1148,7 +1196,7 @@ def main():
         update_report(payload)
         if args.update_locations:
             repair = payload.get("history_repair", {})
-            payload["status"] = "partial" if repair.get("failed") or repair.get("skipped") or repair.get("database_errors") else "complete"
+            payload["status"] = "partial" if repair.get("failed") or repair.get("skipped") or repair.get("database_errors") or schedule["cooldown_deferred"] or schedule["budget_deferred"] else "complete"
         else:
             payload["status"] = "complete" if collection_complete(payload) else "partial"
     except (KeyboardInterrupt, ImportError, RuntimeError, ValueError, OSError, websocket.WebSocketException) as exc:
