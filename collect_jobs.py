@@ -203,6 +203,14 @@ def wait_authenticated(cdp, timeout):
     return False
 
 
+def page_auth_ready(cdp, root=None, page_text=None):
+    """缺少账号节点可能是加载中；只有明确登录提示才报告登录失效。"""
+    state = authentication_state(cdp, root, page_text)
+    if state == "logged_out":
+        raise LoginRequired("页面明确提示需要登录，暂停读取。")
+    return state == "authenticated"
+
+
 def require_login(cdp, return_url, no_prompt=False):
     if wait_authenticated(cdp, 6):
         return
@@ -218,6 +226,7 @@ def require_login(cdp, return_url, no_prompt=False):
 
 def wait_cards(cdp, timeout=20):
     deadline = time.monotonic() + timeout
+    last_reason = "未出现岗位列表"
     while time.monotonic() < deadline:
         try:
             root = document(cdp)
@@ -225,15 +234,15 @@ def wait_cards(cdp, timeout=20):
                 "nodeId": root["nodeId"], "selector": "li.job-card-box"
             }).get("nodeIds", [])
             if cards:
-                if authentication_state(cdp, root) != "authenticated":
-                    raise LoginRequired("列表已出现，但当前未确认已登录。")
-                return cards
+                if page_auth_ready(cdp, root):
+                    return cards
+                last_reason = "列表已出现，但账号标志尚未就绪，无法确认登录状态"
         except AccessGate:
             raise
         except RuntimeError:
             pass  # 导航时节点会失效，重新获取根节点。
         time.sleep(0.4)
-    raise TimeoutError("20 秒内未出现岗位列表；可能需要登录、处理页面提示或调整选择器。")
+    raise TimeoutError(f"等待岗位列表超时：{last_reason}；可能是加载缓慢或选择器变化。")
 
 
 def screenshot_geometry(box, metrics, padding=8):
@@ -364,8 +373,11 @@ def read_description(cdp, job, folder, timeout=20, capture_only=False, navigate_
                 data = snapshot(cdp)
                 page_text = rendered_text(data)
                 check_gate(page_text)
-                if authentication_state(cdp, root, page_text) != "authenticated":
-                    raise LoginRequired("详情已出现，但未确认已登录，不能将游客预览视作完整描述。")
+                if not page_auth_ready(cdp, root, page_text):
+                    candidate, candidate_since = None, None
+                    last_reason = "正文已出现，但账号标志尚未就绪，无法确认登录状态"
+                    time.sleep(0.4)
+                    continue
                 text = rendered_text(data, backend).strip()
                 now = time.monotonic()
                 loading = text.strip(" .…。，\t\r\n").casefold() in ("加载中", "正在加载", "loading")
@@ -389,9 +401,8 @@ def read_description(cdp, job, folder, timeout=20, capture_only=False, navigate_
                         print("  正文含混淆字符或无法读取，改用分段多行 OCR……", flush=True)
 
                         def guard():
-                            state = authentication_state(cdp)
-                            if state != "authenticated":
-                                raise LoginRequired("正文 OCR 期间未确认登录，等待重新登录。")
+                            if not page_auth_ready(cdp) and not wait_authenticated(cdp, 3):
+                                raise RuntimeError("正文截图期间账号标志未就绪，未继续截图；不能据此确认登录失效。")
 
                         def resolve_description_node():
                             fresh_root = document(cdp)
@@ -713,8 +724,10 @@ def read_detail_salary(cdp, job, folder, engine_state, timeout=15):
             page_text = rendered_text(data)
             check_gate(page_text)
             if urlsplit(root.get("documentURL", "")).path == urlsplit(job["url"]).path:
-                if authentication_state(cdp, root, page_text) != "authenticated":
-                    raise LoginRequired("历史岗位详情未确认登录，不能读取游客预览薪资。")
+                if not page_auth_ready(cdp, root, page_text):
+                    last_reason = "薪资页面已打开，但账号标志尚未就绪，无法确认登录状态"
+                    time.sleep(0.4)
+                    continue
                 node = query(cdp, root["nodeId"], ".job-banner .salary, .info-primary .salary")
                 if node:
                     backend = cdp.call("DOM.describeNode", {"nodeId": node})["node"]["backendNodeId"]

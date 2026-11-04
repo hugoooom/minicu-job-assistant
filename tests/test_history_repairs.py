@@ -147,6 +147,39 @@ class HistoryRepairTests(unittest.TestCase):
             self.assertEqual(saved["history_repair"]["repaired"], 1)
             self.assertEqual(saved["collected_count"], 0)
 
+    def test_salary_waits_for_account_ui_and_does_not_navigate_twice(self):
+        current, cdp, clock = job("test", salary=None), Mock(), [0]
+        cdp.call.return_value = {"node": {"backendNodeId": 3}}
+        def sleep(seconds): clock[0] += seconds
+        with tempfile.TemporaryDirectory() as directory, patch.object(app, "navigate") as navigate, \
+                patch.object(app, "document", return_value={"nodeId": 1, "documentURL": current["url"]}), \
+                patch.object(app, "snapshot"), patch.object(app, "rendered_text", side_effect=lambda data, backend=None: "180-220元/天" if backend else "正常页面"), \
+                patch.object(app, "authentication_state", side_effect=["unconfirmed", "unconfirmed", "authenticated"]), \
+                patch.object(app, "query", return_value=2) as query, patch.object(app.time, "sleep", side_effect=sleep), \
+                patch.object(app.time, "monotonic", side_effect=lambda: clock[0]):
+            fields = app.read_detail_salary(cdp, current, Path(directory), [None], timeout=2)
+        self.assertEqual(fields["salary"], "180-220元/天")
+        navigate.assert_called_once()
+        query.assert_called_once()
+        self.assertGreaterEqual(clock[0], .8)
+
+    def test_salary_unconfirmed_timeout_and_real_gate_do_not_read_guest_values(self):
+        for state, page_text, error in [("unconfirmed", "正常页面", TimeoutError),
+                                         ("logged_out", "正常页面", app.LoginRequired),
+                                         ("authenticated", "请完成安全验证", app.AccessGate)]:
+            with self.subTest(state=state, text=page_text), tempfile.TemporaryDirectory() as directory:
+                current, clock = job("test", salary=None), [0]
+                def sleep(seconds): clock[0] += seconds
+                with patch.object(app, "navigate"), patch.object(app, "document", return_value={"nodeId": 1, "documentURL": current["url"]}), \
+                        patch.object(app, "snapshot"), patch.object(app, "rendered_text", return_value=page_text), \
+                        patch.object(app, "authentication_state", return_value=state), patch.object(app, "query") as query, \
+                        patch.object(app, "salary_screenshot") as screenshot, patch.object(app.time, "sleep", side_effect=sleep), \
+                        patch.object(app.time, "monotonic", side_effect=lambda: clock[0]):
+                    with self.assertRaises(error):
+                        app.read_detail_salary(Mock(), current, Path(directory), [None], timeout=1)
+                query.assert_not_called()
+                screenshot.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -9,9 +9,11 @@ import description_ocr as ocr
 
 
 class DescriptionReadinessTests(unittest.TestCase):
-    def read_texts(self, texts, *, authenticated=True, wrong_url=False):
+    def read_texts(self, texts, *, authenticated=True, wrong_url=False, auth_states=None):
         clock = [0.0]
         values = itertools.chain(texts, itertools.repeat(texts[-1]))
+        states = auth_states or ["authenticated" if authenticated else "unconfirmed"]
+        state_values = itertools.chain(states, itertools.repeat(states[-1]))
         job = {"id": "short", "url": "https://www.zhipin.com/job_detail/short.html"}
         root = {"nodeId": 1, "documentURL": job["url"] if not wrong_url else "about:blank"}
         cdp = Mock()
@@ -27,7 +29,7 @@ class DescriptionReadinessTests(unittest.TestCase):
                 patch.object(app, "navigate"), patch.object(app, "document", return_value=root), \
                 patch.object(app, "query", return_value=2), patch.object(app, "snapshot"), \
                 patch.object(app, "rendered_text", side_effect=rendered), \
-                patch.object(app, "authentication_state", return_value="authenticated" if authenticated else "unconfirmed"), \
+                patch.object(app, "authentication_state", side_effect=lambda *a: next(state_values)), \
                 patch.object(app.time, "monotonic", side_effect=lambda: clock[0]), \
                 patch.object(app.time, "sleep", side_effect=sleep), \
                 patch.object(ocr, "extract_description") as fallback:
@@ -61,8 +63,18 @@ class DescriptionReadinessTests(unittest.TestCase):
         self.assertEqual(result, "有量化经验。")
 
     def test_short_text_does_not_bypass_login_check(self):
-        with self.assertRaises(app.LoginRequired):
+        with self.assertRaisesRegex(TimeoutError, "账号标志尚未就绪"):
             self.read_texts(["有量化经验。"], authenticated=False)
+
+    def test_delayed_account_marker_waits_then_reads_without_relogin(self):
+        text = "有量化经验，从事过股票基金交易行业。"
+        result, elapsed, _ = self.read_texts([text], auth_states=["unconfirmed", "unconfirmed", "authenticated"])
+        self.assertEqual(result, text)
+        self.assertGreaterEqual(elapsed, 1.8)
+
+    def test_explicit_login_prompt_still_stops_description_read(self):
+        with self.assertRaises(app.LoginRequired):
+            self.read_texts(["有量化经验。"], auth_states=["logged_out"])
 
     def test_short_text_does_not_bypass_job_url_check(self):
         with self.assertRaisesRegex(TimeoutError, "URL 与目标岗位不一致"):

@@ -37,6 +37,8 @@ python -m venv .venv
 
 首次登录或登录过期时，需要在专用浏览器中手动完成登录。正常登录状态下，搜索、读取列表、打开详情和保存结果均自动完成。
 
+页面切换时账号标志可能晚于岗位内容加载。列表、正文及历史薪资补采会等待账号标志就绪；等待超时记录为该页面读取失败，不把“暂未检测到”直接解释成登录失效，也不读取未确认登录的预览内容。明确出现登录提示或安全验证时仍暂停处理。
+
 ### Windows 依赖排查
 
 `ImportError: onnxruntime is not installed.` 表示运行脚本的 Python 无法加载 OCR 推理依赖。只安装 `rapidocr` 不足以准备本项目环境；完整依赖已列在 `requirements.txt`。请始终用同一个 Python 安装和运行，推荐使用上面的 `.venv` 命令。下载 ZIP 的用户请在解压后包含 `requirements.txt` 的项目目录打开 PowerShell。

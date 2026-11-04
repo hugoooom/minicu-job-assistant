@@ -14,8 +14,17 @@ class LoginTests(unittest.TestCase):
         cdp.call.return_value = {"nodeIds": [1, 2]}
         with patch.object(app, "document", return_value={"nodeId": 1}):
             with patch.object(app, "authentication_state", return_value="unconfirmed"):
-                with self.assertRaises(app.LoginRequired):
-                    app.wait_cards(cdp)
+                with patch.object(app.time, "monotonic", side_effect=[0, 0, 2]), patch.object(app.time, "sleep"):
+                    with self.assertRaisesRegex(TimeoutError, "账号标志尚未就绪"):
+                        app.wait_cards(cdp, timeout=1)
+
+    def test_explicit_logged_out_list_still_requires_login(self):
+        cdp = Mock()
+        cdp.call.return_value = {"nodeIds": [1]}
+        with patch.object(app, "document", return_value={"nodeId": 1}), \
+                patch.object(app, "authentication_state", return_value="logged_out"):
+            with self.assertRaises(app.LoginRequired):
+                app.wait_cards(cdp)
 
     def test_no_prompt_stops_before_guest_collection(self):
         with patch.object(app, "wait_authenticated", return_value=False):
