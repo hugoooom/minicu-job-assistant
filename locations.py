@@ -10,6 +10,10 @@ LOCATION_COLUMNS = {"card_location": "TEXT", "location_city": "TEXT", "location_
                     "location_source": "TEXT", "longitude": "REAL", "latitude": "REAL", "coordinate_system": "TEXT"}
 
 
+class LocationNotProvided(ValueError):
+    """页面已经就绪，但这种岗位页面没有公开工作地址。"""
+
+
 def has_detail_location(job):
     return job.get("location_source") in DETAIL_SOURCES and isinstance(job.get("location"), str) and bool(job["location"].strip())
 

@@ -171,6 +171,9 @@ python collect_jobs.py --city 广州 --update-locations
 ```
 
 该模式处理原地址尚不是有效详情来源的记录，并沿用失效岗位删除和登录检查。
+猎头/代招页面若正文已稳定、仍没有工作地址，确认短暂稳定后会快速跳过，
+记录 `location_status=not_provided` 和 `history_repair.address_not_provided`，保留原地址及岗位。
+有工作地址的猎头页面照常读取；普通加载中或尚未确认登录的页面不会直接按“未提供”跳过。
 更新结果写回 SQLite，明细位于本轮 `repairs/`；根 CSV 只含新增岗位，因此该模式的根 CSV 为空表。
 尚未入库的旧 JSON 可先导入再补采。单个岗位多个地址时，当前只保存工作地址区的第一个地址。
 

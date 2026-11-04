@@ -28,7 +28,7 @@ from job_db import turn_db
 from history_repairs import load_missing_jobs, missing_fields, valid_job_url
 from job_lifecycle import (JobUnavailable, TERMINAL_MARKERS, delete_unavailable_job,
                            platform_id, terminal_reason)
-from locations import DETAIL_SOURCES, has_detail_location, location_fields
+from locations import DETAIL_SOURCES, LocationNotProvided, has_detail_location, location_fields
 
 from extract_first_job import CardParser, needs_ocr
 from inspect_cdp import OUTPUT, PORT, PROFILE, build_command, ensure_port_free, find_edge, wait_for_cdp
@@ -421,6 +421,7 @@ def read_location_from_page(cdp, job, folder, root, data, engine_state=None):
     if urlsplit(document(cdp).get("documentURL", "")).path != urlsplit(job["url"]).path:
         raise ValueError("工作地址读取期间页面已切换，未更新地址。")
     fields = location_fields(address, source, raw_coordinates)
+    fields["location_status"] = "ok"
     fields["card_location"] = job.get("card_location") or (
         job.get("location") if job.get("location_source") not in DETAIL_SOURCES else None)
     fields["location_coordinates_raw"] = raw_coordinates
@@ -434,6 +435,7 @@ def read_detail_location(cdp, job, folder, engine_state=None, navigate_page=True
         navigate(cdp, job["url"])
     deadline = time.monotonic() + timeout
     last_reason = "工作地址未就绪"
+    candidate, candidate_since = None, None
     while time.monotonic() < deadline:
         try:
             root, data = document(cdp), snapshot(cdp)
@@ -442,11 +444,33 @@ def read_detail_location(cdp, job, folder, engine_state=None, navigate_page=True
             check_job_unavailable(cdp, job, folder, root, data, text)
             if urlsplit(root.get("documentURL", "")).path == urlsplit(job["url"]).path:
                 if page_auth_ready(cdp, root, text):
-                    return read_location_from_page(cdp, job, folder, root, data, engine_state)
-                last_reason = "账号标志尚未就绪"
-        except (AccessGate, JobUnavailable):
+                    address_node = query(cdp, root["nodeId"], ".company-address .location-address, .job-location .location-address")
+                    if address_node:
+                        return read_location_from_page(cdp, job, folder, root, data, engine_state)
+                    badge = query(cdp, root["nodeId"], '.info-primary img.job-medium-icon[alt="猎头职位"]')
+                    desc = query(cdp, root["nodeId"], ".job-detail-body .desc, .job-sec-text") if badge else 0
+                    body = ""
+                    if desc:
+                        backend = cdp.call("DOM.describeNode", {"nodeId": desc})["node"]["backendNodeId"]
+                        body = rendered_text(data, backend).strip()
+                    if body and body.strip(" .…。，\t\r\n").casefold() not in ("加载中", "正在加载", "loading"):
+                        now = time.monotonic()
+                        if body != candidate:
+                            candidate, candidate_since = body, now
+                        elif now - candidate_since >= 0.8:
+                            raise LocationNotProvided("该猎头/代招页面未公开详细工作地址，保留原地址并跳过地址补采。")
+                    else:
+                        candidate, candidate_since = None, None
+                    last_reason = "等待工作地址出现"
+                else:
+                    candidate, candidate_since = None, None
+                    last_reason = "账号标志尚未就绪"
+            else:
+                candidate, candidate_since = None, None
+        except (AccessGate, JobUnavailable, LocationNotProvided):
             raise
         except (RuntimeError, ValueError) as exc:
+            candidate, candidate_since = None, None
             last_reason = str(exc)
         time.sleep(0.4)
     raise TimeoutError(f"工作地址读取超时：{last_reason}")
@@ -883,7 +907,7 @@ def repair_missing_history(cdp, groups, payload, folder, path, database, no_prom
     """修复单独记账，不加入本轮新增 jobs；每个缺失字段每轮重试一次。"""
     report = {"requested": sum(len(jobs) for jobs in groups.values()), "attempted": 0,
               "repaired": 0, "failed": 0, "skipped": 0, "deleted": 0, "unavailable": 0,
-              "files": [], "database_errors": []}
+              "files": [], "database_errors": [], "address_not_provided": 0}
     payload["history_repair"] = report
     engine_state = [None]
     deleted_targets = {}
@@ -948,6 +972,10 @@ def repair_missing_history(cdp, groups, payload, folder, path, database, no_prom
                             job.pop("location_error", None)
                         except (AccessGate, JobUnavailable):
                             raise
+                        except LocationNotProvided as exc:
+                            job.update(location_status="not_provided", location_error=str(exc))
+                            report["address_not_provided"] += 1
+                            print(f"  {exc}", flush=True)
                         except (RuntimeError, ValueError, OSError, websocket.WebSocketException) as exc:
                             job["location_error"] = str(exc)
                     if repair_succeeded(job):

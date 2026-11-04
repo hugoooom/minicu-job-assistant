@@ -9,7 +9,7 @@ from unittest.mock import Mock, patch
 import collect_jobs as app
 import job_db
 from history_repairs import load_missing_jobs
-from locations import LOCATION_COLUMNS, address_parts, coordinates, location_fields
+from locations import LOCATION_COLUMNS, LocationNotProvided, address_parts, coordinates, location_fields
 
 
 def job():
@@ -120,6 +120,55 @@ class LocationTests(unittest.TestCase):
             self.assertEqual(saved['search_mode'], 'location_backfill')
             self.assertEqual(saved['requested_count'], 0)
             self.assertEqual(saved['history_repair']['repaired'], 1)
+
+    def test_headhunter_without_address_skips_quickly_after_body_stabilizes(self):
+        for badge, body, appears, error in [
+                (True, '完整岗位正文', False, LocationNotProvided),
+                (False, '完整岗位正文', False, TimeoutError),
+                (True, '加载中...', False, TimeoutError),
+                (True, '完整岗位正文', True, None)]:
+            with self.subTest(badge=badge, body=body, appears=appears), tempfile.TemporaryDirectory() as directory:
+                current, clock, cdp = job(), [0.0], Mock()
+                cdp.call.return_value = {'node': {'backendNodeId': 4}}
+                def sleep(seconds): clock[0] += seconds
+                def query(c, root, selector):
+                    if 'location-address' in selector:
+                        return 2 if appears and clock[0] >= .8 else 0
+                    if 'job-medium-icon' in selector:
+                        return 3 if badge else 0
+                    return 4
+                with patch.object(app, 'document', return_value={'nodeId':1,'documentURL':current['url']}), \
+                        patch.object(app, 'snapshot'), patch.object(app, 'rendered_text', side_effect=lambda data, backend=None: body if backend else '正常页面'), \
+                        patch.object(app, 'page_auth_ready', return_value=True), patch.object(app, 'query', side_effect=query), \
+                        patch.object(app.time, 'monotonic', side_effect=lambda: clock[0]), patch.object(app.time, 'sleep', side_effect=sleep), \
+                        patch.object(app, 'read_location_from_page', return_value=location_fields('广州番禺区淘商城C座')) as reader:
+                    if error:
+                        with self.assertRaises(error):
+                            app.read_detail_location(cdp, current, Path(directory), navigate_page=False, timeout=2)
+                        reader.assert_not_called()
+                        if error is LocationNotProvided:
+                            self.assertLess(clock[0], 2)
+                    else:
+                        fields = app.read_detail_location(cdp, current, Path(directory), navigate_page=False, timeout=2)
+                        self.assertEqual(fields['location_district'], '番禺区')
+
+    def test_no_address_variant_preserves_row_and_continues_to_next_record(self):
+        with tempfile.TemporaryDirectory() as directory:
+            folder, first, second = Path(directory), job(), job()
+            second.update(id='second', title='另一个岗位', url='https://www.zhipin.com/job_detail/second.html')
+            source = folder / 'source.json'
+            app.save_jobs(source, {'city':'广州','keyword':'Python','jobs':[first,second]})
+            job_db.turn_db(source, folder / 'jobs.db')
+            data = {'city':'广州','keyword':'Python','requested_count':200,'jobs':[]}
+            with patch.object(app, 'read_detail_location', side_effect=[LocationNotProvided('未提供工作地址'), location_fields('广州天河区科技园')]) as reader, patch.object(app.time, 'sleep'):
+                app.repair_missing_history(Mock(), load_missing_jobs(folder / 'jobs.db', '广州', include_locations=True),
+                                           data, folder, folder / 'jobs.json', folder / 'jobs.db')
+            self.assertEqual(reader.call_count, 2)
+            self.assertEqual(data['history_repair']['address_not_provided'], 1)
+            self.assertEqual(data['history_repair']['deleted'], 0)
+            with closing(sqlite3.connect(folder / 'jobs.db')) as con:
+                self.assertEqual(con.execute('SELECT location FROM jobs WHERE platform_job_id="test"').fetchone()[0], '广州')
+                self.assertEqual(con.execute('SELECT location FROM jobs WHERE platform_job_id="second"').fetchone()[0], '广州天河区科技园')
 
 
 if __name__ == '__main__':
