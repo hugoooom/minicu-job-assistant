@@ -26,6 +26,8 @@ from search_regions import CITY_CODES, DISTRICTS, search_url, selected_districts
 from district_progress import DistrictProgress
 from job_db import turn_db
 from history_repairs import load_missing_jobs, missing_fields, valid_job_url
+from job_lifecycle import (JobUnavailable, TERMINAL_MARKERS, delete_unavailable_job,
+                           platform_id, terminal_reason)
 
 from extract_first_job import CardParser, needs_ocr
 from inspect_cdp import OUTPUT, PORT, PROFILE, build_command, ensure_port_free, find_edge, wait_for_cdp
@@ -351,6 +353,45 @@ def read_list(cdp, nodes, folder, skip_keys=None, limit=None, engine_state=None,
     return jobs
 
 
+def check_job_unavailable(cdp, job, folder, root, data, page_text):
+    """只接受岗位状态/错误区域的明确提示，并重新读取一次确认。"""
+    if not isinstance(page_text, str) or not any(marker in page_text for marker in TERMINAL_MARKERS):
+        return
+
+    def detect(current_root, current_data, text):
+        def scoped(selector):
+            node = query(cdp, current_root["nodeId"], selector)
+            if not node:
+                return ""
+            backend = cdp.call("DOM.describeNode", {"nodeId": node})["node"]["backendNodeId"]
+            return rendered_text(current_data, backend).strip()
+        status = scoped(".job-banner .job-status, .info-primary .job-status")
+        error = scoped(".error-content, .error-page, .job-error, .error-tip")
+        # 错误容器变化时，仅接受整行明确提示，不能按 JD 中提及的词删除。
+        if not error:
+            error = "\n".join(line for line in text.splitlines() if re.fullmatch(
+                r"\s*(?:抱歉[，,！!]?\s*)?(?:该|此|您访问的|你访问的)?(?:职位|岗位|页面)"
+                r"(?:已被删除|已删除|不存在|已关闭|已下架|已下线|已失效|已停止招聘|已结束招聘)[。！!\s]*", line))
+        return terminal_reason(job["url"], current_root.get("documentURL", ""), status, error,
+            has_body=bool(scoped(".job-detail-body .desc, .job-sec-text")),
+            has_cards=bool(query(cdp, current_root["nodeId"], "li.job-card-box")))
+
+    signal = detect(root, data, page_text)
+    if signal is None:
+        return
+    time.sleep(0.5)
+    fresh_root, fresh_data = document(cdp), snapshot(cdp)
+    fresh_text = rendered_text(fresh_data)
+    check_gate(fresh_text)
+    if detect(fresh_root, fresh_data, fresh_text) != signal:
+        return
+    evidence = dict(signal, expected_url=job["url"], observed_url=fresh_root.get("documentURL", ""),
+                    checked_at=datetime.now().isoformat(timespec="seconds"))
+    (folder / f"{job['id']}-unavailable.json").write_text(
+        json.dumps(evidence, ensure_ascii=False, indent=2), encoding="utf-8")
+    raise JobUnavailable(evidence)
+
+
 def read_description(cdp, job, folder, timeout=20, capture_only=False, navigate_page=True):
     if navigate_page:
         navigate(cdp, job["url"])
@@ -361,18 +402,18 @@ def read_description(cdp, job, folder, timeout=20, capture_only=False, navigate_
         try:
             root = document(cdp)
             current = urlsplit(root.get("documentURL", ""))
+            data = snapshot(cdp)
+            page_text = rendered_text(data)
+            check_gate(page_text)
+            check_job_unavailable(cdp, job, folder, root, data, page_text)
             if current.path != urlsplit(job["url"]).path:
                 candidate, candidate_since = None, None
                 last_reason = "当前页面 URL 与目标岗位不一致"
-                check_gate(rendered_text(snapshot(cdp)))
                 time.sleep(0.4)
                 continue
             description_id = query(cdp, root["nodeId"], ".job-detail-body .desc, .job-sec-text")
             if description_id:
                 backend = cdp.call("DOM.describeNode", {"nodeId": description_id})["node"]["backendNodeId"]
-                data = snapshot(cdp)
-                page_text = rendered_text(data)
-                check_gate(page_text)
                 if not page_auth_ready(cdp, root, page_text):
                     candidate, candidate_since = None, None
                     last_reason = "正文已出现，但账号标志尚未就绪，无法确认登录状态"
@@ -723,6 +764,7 @@ def read_detail_salary(cdp, job, folder, engine_state, timeout=15):
             data = snapshot(cdp)
             page_text = rendered_text(data)
             check_gate(page_text)
+            check_job_unavailable(cdp, job, folder, root, data, page_text)
             if urlsplit(root.get("documentURL", "")).path == urlsplit(job["url"]).path:
                 if not page_auth_ready(cdp, root, page_text):
                     last_reason = "薪资页面已打开，但账号标志尚未就绪，无法确认登录状态"
@@ -765,9 +807,11 @@ def read_detail_salary(cdp, job, folder, engine_state, timeout=15):
 def repair_missing_history(cdp, groups, payload, folder, path, database, no_prompt=False):
     """修复单独记账，不加入本轮新增 jobs；每个缺失字段每轮重试一次。"""
     report = {"requested": sum(len(jobs) for jobs in groups.values()), "attempted": 0,
-              "repaired": 0, "failed": 0, "skipped": 0, "files": [], "database_errors": []}
+              "repaired": 0, "failed": 0, "skipped": 0, "deleted": 0, "unavailable": 0,
+              "files": [], "database_errors": []}
     payload["history_repair"] = report
     engine_state = [None]
+    deleted_targets = {}
     for keyword, jobs in groups.items():
         group_folder = folder / "repairs" / hashlib.sha256(keyword.encode("utf-8")).hexdigest()[:16]
         group_folder.mkdir(parents=True, exist_ok=True)
@@ -777,6 +821,10 @@ def repair_missing_history(cdp, groups, payload, folder, path, database, no_prom
                  "requested_count": len(jobs), "jobs": jobs, "status": "running"}
         try:
             for job in jobs:
+                target_id = platform_id(job.get("url"))
+                if target_id in deleted_targets:
+                    job.update(repair_status="deleted", unavailable_evidence=deleted_targets[target_id])
+                    continue
                 if not valid_job_url(job.get("url")):
                     job["repair_error"] = "缺少有效的 BOSS 详情 URL，未自动访问。"
                     report["skipped"] += 1
@@ -797,6 +845,8 @@ def repair_missing_history(cdp, groups, payload, folder, path, database, no_prom
                             page_ready = True
                         except AccessGate:
                             raise
+                        except JobUnavailable:
+                            raise
                         except (RuntimeError, ValueError, OSError, websocket.WebSocketException) as exc:
                             job["salary_retry_error"] = str(exc)
                     if "description" in missing_fields(job):
@@ -807,18 +857,32 @@ def repair_missing_history(cdp, groups, payload, folder, path, database, no_prom
                             job.pop("description_error", None)
                         except AccessGate:
                             raise
+                        except JobUnavailable:
+                            raise
                         except (RuntimeError, ValueError, OSError, websocket.WebSocketException) as exc:
                             job.update(description_status="error", description_error=str(exc))
                     if not missing_fields(job):
                         report["repaired"] += 1
                     else:
                         report["failed"] += 1
+                except JobUnavailable as exc:
+                    try:
+                        count = delete_unavailable_job(database, payload["city"], job, exc.evidence)
+                        job.update(repair_status="deleted", unavailable_evidence=exc.evidence)
+                        deleted_targets[target_id] = exc.evidence
+                        report["deleted"] += count
+                        report["unavailable"] += 1
+                        print(f"  岗位已失效，删除 {count} 条数据库记录并继续：{exc}", flush=True)
+                    except (OSError, ValueError, sqlite3.Error) as delete_error:
+                        job["repair_error"] = f"已确认失效，但删除失败：{delete_error}"
+                        report["failed"] += 1
+                        print(job["repair_error"], flush=True)
                 finally:
                     update_report(batch)
                     save_jobs(group_path, batch)
                     save_jobs(path, payload)
                 time.sleep(2)
-            batch["status"] = "complete" if all(not missing_fields(j) for j in jobs) else "partial"
+            batch["status"] = "complete" if all(j.get("repair_status") == "deleted" or not missing_fields(j) for j in jobs) else "partial"
         except BaseException:
             batch["status"] = "stopped"
             raise
@@ -829,7 +893,7 @@ def repair_missing_history(cdp, groups, payload, folder, path, database, no_prom
             if batch["database"]["status"] != "ok":
                 report["database_errors"].append({"keyword": keyword, "error": batch["database"]["error"]})
             save_jobs(path, payload)
-    print(f"历史修复：成功 {report['repaired']}，仍缺失 {report['failed']}，无有效 URL {report['skipped']}。", flush=True)
+    print(f"历史修复：成功 {report['repaired']}，失效删除 {report['deleted']}，仍缺失 {report['failed']}，无有效 URL {report['skipped']}。", flush=True)
 
 
 def import_collected_jobs(path, payload, database):

@@ -7,6 +7,7 @@ from contextlib import closing
 from pathlib import Path
 
 from job_history import job_identity, normalized_name
+from job_lifecycle import ensure_deleted_schema, exclude_deleted_rows
 
 
 DEFAULT_DB = Path(__file__).resolve().parent / "output" / "jobs.db"
@@ -107,6 +108,8 @@ def load_rows(files):
             for index, job in enumerate(data["jobs"], start=1):
                 if not isinstance(job, dict):
                     raise ValueError(f"第 {index} 条岗位不是对象。")
+                if job.get("repair_status") == "deleted":
+                    continue
                 identity = json.dumps(job_identity(job), ensure_ascii=False)
                 salary = text_or_none(job.get("salary"))
                 salary_status = text_or_none(job.get("salary_status")) or ("ok" if salary else "missing")
@@ -142,6 +145,7 @@ def ensure_schema(connection):
         if not {"city_key", "keyword_key", "job_key", "source_file", "last_imported_at"} <= columns:
             raise ValueError("已有 jobs 表结构不兼容，请通过 --db 指定一个新的数据库文件。")
     connection.execute(SCHEMA)
+    ensure_deleted_schema(connection)
 
 
 def initialize_database(db_path=DEFAULT_DB):
@@ -163,14 +167,16 @@ def turn_db(input_path, db_path=DEFAULT_DB):
     with closing(sqlite3.connect(path)) as connection:
         with connection:
             ensure_schema(connection)
+            filtered_rows = exclude_deleted_rows(connection, rows)
             before = connection.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
-            connection.executemany(UPSERT, rows)
+            connection.executemany(UPSERT, filtered_rows)
             after = connection.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
             groups = connection.execute(
                 "SELECT city, keyword, COUNT(*) FROM jobs "
                 "GROUP BY city_key, keyword_key ORDER BY city_key, keyword_key"
             ).fetchall()
-    return {"database": str(path), "files": len(files), "processed": len(rows),
+    return {"database": str(path), "files": len(files), "processed": len(filtered_rows),
+            "suppressed_deleted": len(rows) - len(filtered_rows),
             "inserted": after - before, "total": after, "groups": groups}
 
 
@@ -191,6 +197,8 @@ def main():
     print("数据库：", report["database"])
     print(f"读取 {report['files']} 个批次、{report['processed']} 条记录；"
           f"新增 {report['inserted']} 条，数据库共 {report['total']} 条。")
+    if report["suppressed_deleted"]:
+        print(f"已按删除记录跳过 {report['suppressed_deleted']} 条失效岗位，未重新入库。")
     for city, keyword, count in report["groups"]:
         print(f"  {city} / {keyword}：{count} 条")
     return 0
