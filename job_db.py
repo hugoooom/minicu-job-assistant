@@ -8,6 +8,7 @@ from pathlib import Path
 
 from job_history import job_identity, normalized_name
 from job_lifecycle import ensure_deleted_schema, exclude_deleted_rows
+from locations import LOCATION_COLUMNS, import_location
 
 
 DEFAULT_DB = Path(__file__).resolve().parent / "output" / "jobs.db"
@@ -43,13 +44,21 @@ INSERT INTO jobs (
     city, keyword, city_key, keyword_key, job_key, platform_job_id,
     title, company, location, salary, salary_status, salary_source,
     description, description_status, description_source,
-    description_ocr_review_required, url, source_file
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    description_ocr_review_required, url, source_file,
+    card_location, location_city, location_district, location_source, longitude, latitude, coordinate_system
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT (city_key, keyword_key, job_key) DO UPDATE SET
     platform_job_id = COALESCE(excluded.platform_job_id, jobs.platform_job_id),
     title = COALESCE(excluded.title, jobs.title),
     company = COALESCE(excluded.company, jobs.company),
-    location = COALESCE(excluded.location, jobs.location),
+    location = CASE WHEN {accept_location} THEN excluded.location ELSE jobs.location END,
+    location_city = CASE WHEN {accept_location} THEN excluded.location_city ELSE jobs.location_city END,
+    location_district = CASE WHEN {accept_location} THEN excluded.location_district ELSE jobs.location_district END,
+    location_source = CASE WHEN {accept_location} THEN excluded.location_source ELSE jobs.location_source END,
+    longitude = CASE WHEN {accept_location} THEN excluded.longitude ELSE jobs.longitude END,
+    latitude = CASE WHEN {accept_location} THEN excluded.latitude ELSE jobs.latitude END,
+    coordinate_system = CASE WHEN {accept_location} THEN excluded.coordinate_system ELSE jobs.coordinate_system END,
+    card_location = COALESCE(excluded.card_location, jobs.card_location),
     salary = COALESCE(excluded.salary, jobs.salary),
     salary_status = CASE WHEN excluded.salary IS NOT NULL OR jobs.salary IS NULL
         THEN excluded.salary_status ELSE jobs.salary_status END,
@@ -66,6 +75,9 @@ ON CONFLICT (city_key, keyword_key, job_key) DO UPDATE SET
     source_file = excluded.source_file,
     last_imported_at = CURRENT_TIMESTAMP;
 """
+UPSERT = UPSERT.format(accept_location="""excluded.location IS NOT NULL AND
+    (excluded.location_source IN ('detail_dom','detail_ocr') OR
+     COALESCE(jobs.location_source,'card') NOT IN ('detail_dom','detail_ocr'))""")
 
 
 def text_or_none(value):
@@ -122,14 +134,16 @@ def load_rows(files):
                     if description_status == "ok":
                         description_status = "missing"
                 review = job.get("description_ocr_review_required")
+                location = import_location(job)
                 rows.append((
                     city, keyword, normalized_name(city), normalized_name(keyword), identity,
                     text_or_none(job.get("id")), text_or_none(job.get("title")),
-                    text_or_none(job.get("company")), text_or_none(job.get("location")),
+                    text_or_none(job.get("company")), location["location"],
                     salary, salary_status, text_or_none(job.get("salary_source")),
                     description, description_status, text_or_none(job.get("description_source")),
                     int(review) if isinstance(review, bool) else None,
                     text_or_none(job.get("url")), str(path),
+                    *(location[key] for key in LOCATION_COLUMNS),
                 ))
         except (OSError, ValueError, TypeError, KeyError) as exc:
             raise ValueError(f"无法导入 {path}：{exc}") from exc
@@ -145,6 +159,10 @@ def ensure_schema(connection):
         if not {"city_key", "keyword_key", "job_key", "source_file", "last_imported_at"} <= columns:
             raise ValueError("已有 jobs 表结构不兼容，请通过 --db 指定一个新的数据库文件。")
     connection.execute(SCHEMA)
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(jobs)")}
+    for name, kind in LOCATION_COLUMNS.items():
+        if name not in columns:
+            connection.execute(f"ALTER TABLE jobs ADD COLUMN {name} {kind}")
     ensure_deleted_schema(connection)
 
 

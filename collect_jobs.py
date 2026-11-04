@@ -28,6 +28,7 @@ from job_db import turn_db
 from history_repairs import load_missing_jobs, missing_fields, valid_job_url
 from job_lifecycle import (JobUnavailable, TERMINAL_MARKERS, delete_unavailable_job,
                            platform_id, terminal_reason)
+from locations import DETAIL_SOURCES, has_detail_location, location_fields
 
 from extract_first_job import CardParser, needs_ocr
 from inspect_cdp import OUTPUT, PORT, PROFILE, build_command, ensure_port_free, find_edge, wait_for_cdp
@@ -392,6 +393,65 @@ def check_job_unavailable(cdp, job, folder, root, data, page_text):
     raise JobUnavailable(evidence)
 
 
+def read_location_from_page(cdp, job, folder, root, data, engine_state=None):
+    """只读取工作地址区，不从公司介绍、搜索条件或地图标签拼地址。"""
+    node = query(cdp, root["nodeId"], ".company-address .location-address, .job-location .location-address")
+    if not node:
+        raise ValueError("详情页尚未提供工作地址。")
+    backend = cdp.call("DOM.describeNode", {"nodeId": node})["node"]["backendNodeId"]
+    address = rendered_text(data, backend).strip()
+    source = "detail_dom"
+    if needs_ocr(address):
+        image = folder / f"{job['id']}-location.png"
+        salary_screenshot(cdp, node, image)
+        engine_state = engine_state if engine_state is not None else [None]
+        if engine_state[0] is None:
+            engine_state[0] = RapidOCR(params={"Global.log_level": "warning"})
+        result = engine_state[0](str(image), use_det=True, use_cls=True, use_rec=True)
+        address = " ".join(result.txts or ()).strip()
+        source = "detail_ocr"
+    if needs_ocr(address):
+        raise ValueError("工作地址仍为空或含混淆字符，保留原地址。")
+    raw_coordinates = None
+    map_node = query(cdp, root["nodeId"], ".company-address .job-location-map, .job-location .job-location-map")
+    if map_node:
+        attrs = cdp.call("DOM.getAttributes", {"nodeId": map_node}).get("attributes", [])
+        attributes = dict(zip(attrs[::2], attrs[1::2]))
+        raw_coordinates = attributes.get("data-lat")
+    if urlsplit(document(cdp).get("documentURL", "")).path != urlsplit(job["url"]).path:
+        raise ValueError("工作地址读取期间页面已切换，未更新地址。")
+    fields = location_fields(address, source, raw_coordinates)
+    fields["card_location"] = job.get("card_location") or (
+        job.get("location") if job.get("location_source") not in DETAIL_SOURCES else None)
+    fields["location_coordinates_raw"] = raw_coordinates
+    if source == "detail_ocr":
+        fields["location_ocr_review_required"] = True
+    return fields
+
+
+def read_detail_location(cdp, job, folder, engine_state=None, navigate_page=True, timeout=15):
+    if navigate_page:
+        navigate(cdp, job["url"])
+    deadline = time.monotonic() + timeout
+    last_reason = "工作地址未就绪"
+    while time.monotonic() < deadline:
+        try:
+            root, data = document(cdp), snapshot(cdp)
+            text = rendered_text(data)
+            check_gate(text)
+            check_job_unavailable(cdp, job, folder, root, data, text)
+            if urlsplit(root.get("documentURL", "")).path == urlsplit(job["url"]).path:
+                if page_auth_ready(cdp, root, text):
+                    return read_location_from_page(cdp, job, folder, root, data, engine_state)
+                last_reason = "账号标志尚未就绪"
+        except (AccessGate, JobUnavailable):
+            raise
+        except (RuntimeError, ValueError) as exc:
+            last_reason = str(exc)
+        time.sleep(0.4)
+    raise TimeoutError(f"工作地址读取超时：{last_reason}")
+
+
 def read_description(cdp, job, folder, timeout=20, capture_only=False, navigate_page=True):
     if navigate_page:
         navigate(cdp, job["url"])
@@ -436,6 +496,12 @@ def read_description(cdp, job, folder, timeout=20, capture_only=False, navigate_
                     bool(text) or now >= deadline - timeout + 2
                 )
                 if dom_ready or ocr_ready:
+                    if "工作地址" in page_text:
+                        try:
+                            job.update(read_location_from_page(cdp, job, folder, root, data))
+                            job.pop("location_error", None)
+                        except (RuntimeError, ValueError, OSError) as exc:
+                            job["location_error"] = str(exc)
                     if needs_ocr(text):
                         from description_ocr import extract_description
 
@@ -794,6 +860,11 @@ def read_detail_salary(cdp, job, folder, engine_state, timeout=15):
                     fields["salary_source"] = source
                     if scores is not None:
                         fields["salary_ocr_scores"] = scores
+                    if "工作地址" in page_text:
+                        try:
+                            fields.update(read_location_from_page(cdp, job, folder, root, data, engine_state))
+                        except (RuntimeError, ValueError, OSError) as exc:
+                            fields["location_error"] = str(exc)
                     return fields
         except AccessGate:
             raise
@@ -802,6 +873,10 @@ def read_detail_salary(cdp, job, folder, engine_state, timeout=15):
             last_reason = str(exc)
         time.sleep(0.4)
     raise TimeoutError(f"历史岗位 URL 未就绪或没有可见薪资，可能已下架或发生跳转：{last_reason}")
+
+
+def repair_succeeded(job):
+    return not missing_fields(job) and (not job.get("location_refresh_required") or has_detail_location(job))
 
 
 def repair_missing_history(cdp, groups, payload, folder, path, database, no_prompt=False):
@@ -855,13 +930,27 @@ def repair_missing_history(cdp, groups, payload, folder, path, database, no_prom
                                                                navigate_page=not page_ready)
                             job.update(description=text, description_status="ok", description_characters=len(text))
                             job.pop("description_error", None)
+                            page_ready = True
                         except AccessGate:
                             raise
                         except JobUnavailable:
                             raise
                         except (RuntimeError, ValueError, OSError, websocket.WebSocketException) as exc:
                             job.update(description_status="error", description_error=str(exc))
-                    if not missing_fields(job):
+                    if job.get("location_refresh_required") and not has_detail_location(job):
+                        try:
+                            try:
+                                fields = read_detail_location(cdp, job, group_folder, engine_state, navigate_page=not page_ready)
+                            except LoginRequired:
+                                require_login(cdp, job["url"], no_prompt)
+                                fields = read_detail_location(cdp, job, group_folder, engine_state, navigate_page=False)
+                            job.update(fields)
+                            job.pop("location_error", None)
+                        except (AccessGate, JobUnavailable):
+                            raise
+                        except (RuntimeError, ValueError, OSError, websocket.WebSocketException) as exc:
+                            job["location_error"] = str(exc)
+                    if repair_succeeded(job):
                         report["repaired"] += 1
                     else:
                         report["failed"] += 1
@@ -882,7 +971,7 @@ def repair_missing_history(cdp, groups, payload, folder, path, database, no_prom
                     save_jobs(group_path, batch)
                     save_jobs(path, payload)
                 time.sleep(2)
-            batch["status"] = "complete" if all(j.get("repair_status") == "deleted" or not missing_fields(j) for j in jobs) else "partial"
+            batch["status"] = "complete" if all(j.get("repair_status") == "deleted" or repair_succeeded(j) for j in jobs) else "partial"
         except BaseException:
             batch["status"] = "stopped"
             raise
@@ -928,6 +1017,7 @@ def main():
     parser.add_argument("--restart-districts", action="store_true", help="忽略续采位置，从指定分区范围的第一个区开始")
     parser.add_argument("--db", type=Path, help="自动入库的 SQLite 文件，默认 output/jobs.db")
     parser.add_argument("--skip-repair", action="store_true", help="本轮跳过数据库中缺失薪资/正文的 URL 重试")
+    parser.add_argument("--update-locations", action="store_true", help="补采所选城市数据库中的详情工作地址，本轮不采新列表")
     parser.add_argument("--max-scrolls", type=int, help="最多滚动加载次数；默认按当前城市历史岗位数自动增加")
     parser.add_argument("--no-prompt", action="store_true", help="未确认登录时直接退出，不采集游客数据")
     parser.add_argument("--include-seen", action="store_true", help="允许再次采集历史岗位，用于复测")
@@ -940,8 +1030,10 @@ def main():
         parser.error("--max-scrolls 不能小于 0")
     if args.limit < 1 or args.empty_rounds < 1:
         parser.error("--limit 和 --empty-rounds 必须大于 0")
+    if args.update_locations and args.skip_repair:
+        parser.error("--update-locations 不能与 --skip-repair 同时使用")
     try:
-        districts = [] if args.citywide else selected_districts(args.city, args.district)
+        districts = [] if args.citywide or args.update_locations else selected_districts(args.city, args.district)
     except ValueError as exc:
         parser.error(str(exc))
     try:
@@ -965,7 +1057,7 @@ def main():
         print(f"从 {districts[0]} 开始；{'严格按条数停止' if args.hard_limit else '先完成当前区，再判断是否达到本轮目标'}。", flush=True)
     database = (args.db if args.db is not None else OUTPUT / "jobs.db").resolve()
     try:
-        missing_jobs = {} if args.skip_repair else load_missing_jobs(database, args.city)
+        missing_jobs = {} if args.skip_repair else load_missing_jobs(database, args.city, include_locations=args.update_locations)
     except (OSError, ValueError, sqlite3.Error) as exc:
         parser.error(f"读取历史修复队列失败：{exc}；可用 --skip-repair 暂时跳过")
     # 即便旧 JSON 被移动，仅存在数据库的修复对象也不能在本轮重复计入新增。
@@ -983,14 +1075,14 @@ def main():
     target = open_task_tab()
     connection = websocket.create_connection(target["webSocketDebuggerUrl"], timeout=10, suppress_origin=True)
     payload = {"keyword": args.keyword, "city": args.city, "status": "running",
-               "requested_count": args.limit, "jobs": [],
+               "requested_count": 0 if args.update_locations else args.limit, "jobs": [],
                "deduplication": "within_run" if args.include_seen else "history",
                "deduplication_fields": ["title", "company"],
                "deduplication_city": args.city,
                "history_file_count": history_files, "historical_job_count": len(excluded_keys),
                "historical_skipped_count": 0, "list_scroll_limit": max_scrolls,
                "list_scroll_budget_mode": "manual" if args.max_scrolls is not None else "automatic",
-               "search_mode": "districts" if districts else "citywide", "districts": districts,
+               "search_mode": "location_backfill" if args.update_locations else ("districts" if districts else "citywide"), "districts": districts,
                "finish_district": bool(districts) and not args.hard_limit, "empty_rounds": args.empty_rounds}
     try:
         cdp = RawCDP(connection)
@@ -1001,7 +1093,9 @@ def main():
             collect_details(cdp, payload, folder, path, args.no_prompt)
             import_collected_jobs(path, payload, database)
 
-        if districts:
+        if args.update_locations:
+            payload["list_stop_reason"] = "location_backfill_only"
+        elif districts:
             payload["list_stop_reason"] = collect_districts(
                 cdp, payload, folder, path, districts, args.no_prompt, max_scrolls, excluded_keys,
                 progress=progress, after_district=after_district
@@ -1014,14 +1108,21 @@ def main():
             payload["list_stop_reason"] = collect_list(
                 cdp, payload, folder, path, list_url, args.no_prompt, max_scrolls, excluded_keys
             )
-        print(f"列表取得 {len(payload['jobs'])}/{args.limit} 条，停止原因：{payload['list_stop_reason']}", flush=True)
+        if args.update_locations:
+            print("本轮仅补采历史工作地址，不采集新增列表。", flush=True)
+        else:
+            print(f"列表取得 {len(payload['jobs'])}/{args.limit} 条，停止原因：{payload['list_stop_reason']}", flush=True)
         if payload["list_stop_reason"] == "max_scrolls_reached":
             print(f"滚动次数已用完；本轮跳过 {payload['historical_skipped_count']} 个历史岗位。"
                   f"可用 --max-scrolls {max_scrolls + 12} 增加下一轮预算，仍会保留历史去重。", flush=True)
         save_jobs(path, payload)
         collect_details(cdp, payload, folder, path, args.no_prompt)
         update_report(payload)
-        payload["status"] = "complete" if collection_complete(payload) else "partial"
+        if args.update_locations:
+            repair = payload.get("history_repair", {})
+            payload["status"] = "partial" if repair.get("failed") or repair.get("skipped") or repair.get("database_errors") else "complete"
+        else:
+            payload["status"] = "complete" if collection_complete(payload) else "partial"
     except (KeyboardInterrupt, ImportError, RuntimeError, ValueError, OSError, websocket.WebSocketException) as exc:
         payload.update(status="stopped", error=str(exc) or "用户中断采集。")
         print("本轮停止：", exc, flush=True)
@@ -1049,7 +1150,7 @@ def main():
     except (OSError, ValueError, KeyError, TypeError) as exc:
         csv_ok = False
         print(f"表格导出失败，JSON 已保留：{exc}", flush=True)
-    print(f"请求 {args.limit} 条，列表 {payload['collected_count']} 条，"
+    print(f"新增目标 {payload['requested_count']} 条，列表 {payload['collected_count']} 条，"
           f"薪资成功 {payload['salary_success_count']} 条，详情成功 {payload['description_success_count']} 条。")
     return 0 if payload["status"] == "complete" and csv_ok and payload["database"]["status"] == "ok" else 1
 

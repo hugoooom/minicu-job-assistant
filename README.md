@@ -64,6 +64,7 @@ python -m venv .venv
 | `--restart-districts` | 忽略续采位置，从指定范围的第一个区重新开始；保留历史去重 |
 | `--db` | 自动导入的 SQLite 文件，默认 `output/jobs.db` |
 | `--skip-repair` | 本轮跳过数据库中缺失薪资/正文的 URL 补采；默认先修复再采新岗位 |
+| `--update-locations` | 只处理所选城市的历史工作地址补采，不采新增列表；已有缺失薪资/正文也会顺便修复 |
 | `--district` | 只采指定区，可传多个，如 `--district 荔湾区 天河区`；默认按所选城市的各区依次采集 |
 | `--citywide` | 使用原来的全市单列表；与 `--district` 互斥 |
 | `--max-scrolls` | 每区滚动安全上限；默认取 `60` 和 `12 + 向上取整(历史岗位数 / 15)` 中较大值；全市模式沿用后者。整区模式触顶则停止本轮并保留当前区位置，不将该区视为已完成 |
@@ -144,6 +145,45 @@ JSON 的 `district_runs` 保存已尝试各区的数量、实际滚动次数、�
 `historical_job_count` 为当前城市的历史唯一岗位标识总数，`historical_skipped_count` 为本轮实际遇到并跳过的历史唯一岗位数；`deduplication_fields` 记录名称与公司字段，`deduplication_city` 记录去重的搜索城市范围。默认按历史量估算滚动预算，分区模式至少 60 次；可显式增加 `--max-scrolls`。`list_scroll_limit`、`list_scroll_count` 和 `list_scroll_budget_mode` 分别记录每区上限、整轮累计次数和预算模式。`requested_count` 是新增目标，不是网站岗位总数；全部区正常处理完且所有已采岗位提取成功时，即使不足目标也可以完成。某区加载失败、滚动触顶或提取失败会记录为部分完成。
 
 去重依赖本地历史结果：删除、移动历史 `jobs.json` 会失去对应记录，旧项目目录的结果不会自动导入。岗位名称或公司名称变化时可能视为新岗位。请依次运行批次；并行运行的批次不保证互相排除尚未保存的岗位。
+
+## 工作地址与可视化字段
+
+新采岗位在读取详情时，会尝试读取“工作地址”区域，使用完整地址更新 `location`，
+不从公司介绍猜地址。保留 `card_location` 原列表地址，并记录 `location_source`（detail_dom/detail_ocr/card）。
+详情地址优先于列表地址：导入旧批次不会把已确认的完整地址覆盖成“广州”这样的简略值。
+读取失败时保留原地址。地址 OCR 的复核标记在 JSON 中记录，不能解释成已人工确认。
+
+数据库按需新增以下字段，保留已有岗位及内部 ID：
+
+| 字段 | 含义 |
+|---|---|
+| `location` | 页面工作地址；尚未补采时可能仍为列表地址 |
+| `card_location` | 原始列表地址 |
+| `location_city`、`location_district` | 从地址明确解析的实际城市/区；无法识别时为 NULL，不使用搜索城市/区代填 |
+| `location_source` | 地址来源，详情 DOM/OCR 优先 |
+| `longitude`、`latitude` | 网站地图元素给出的原始经纬度；缺失/非法值保留 NULL |
+| `coordinate_system` | 目前为 unknown，网站坐标系未核实，未当成 WGS84 或自动转换 |
+
+批量补采已有岗位（通过原详情 URL，不采新列表、不改变分区续采位置）：
+
+```powershell
+python collect_jobs.py --city 广州 --update-locations
+```
+
+该模式处理原地址尚不是有效详情来源的记录，并沿用失效岗位删除和登录检查。
+更新结果写回 SQLite，明细位于本轮 `repairs/`；根 CSV 只含新增岗位，因此该模式的根 CSV 为空表。
+尚未入库的旧 JSON 可先导入再补采。单个岗位多个地址时，当前只保存工作地址区的第一个地址。
+
+例如统计已读取详情地址的岗位分布：
+
+```sql
+SELECT location_city, location_district, COUNT(*) AS job_count
+FROM jobs
+WHERE location_source IN ('detail_dom', 'detail_ocr')
+GROUP BY location_city, location_district;
+```
+
+地图可视化前需先核实坐标系；现阶段可以直接做已采样本的城市/区分布统计，不能宣称全市场覆盖。
 
 ## 导出 CSV
 

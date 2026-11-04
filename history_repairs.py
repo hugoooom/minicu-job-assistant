@@ -5,6 +5,7 @@ import sqlite3
 from contextlib import closing
 from urllib.parse import urlsplit
 from job_history import normalized_name
+from locations import LOCATION_COLUMNS, has_detail_location
 
 
 def missing_fields(job):
@@ -23,7 +24,7 @@ def valid_job_url(url):
             and re.fullmatch(r"/job_detail/[^/]+\.html", parsed.path) is not None)
 
 
-def load_missing_jobs(database, city):
+def load_missing_jobs(database, city, include_locations=False):
     """按所选城市修复所有关键词组；库不存在时没有待修复记录。"""
     if not database.exists():
         return {}
@@ -32,10 +33,14 @@ def load_missing_jobs(database, city):
         exists = connection.execute("SELECT 1 FROM sqlite_master WHERE name='jobs' AND type='table'").fetchone()
         if not exists:
             return {}
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(jobs)")}
+        location_condition = ""
+        if include_locations:
+            location_condition = " OR location IS NULL OR trim(location)='' OR COALESCE(location_source,'card') NOT IN ('detail_dom','detail_ocr')" if 'location_source' in columns else " OR 1=1"
         rows = connection.execute(
             "SELECT * FROM jobs WHERE city_key = ? AND "
-            "(salary IS NULL OR trim(salary)='' OR description IS NULL OR trim(description)='') "
-            "ORDER BY id", (normalized_name(city),)
+            "(salary IS NULL OR trim(salary)='' OR description IS NULL OR trim(description)=''"
+            + location_condition + ") ORDER BY id", (normalized_name(city),)
         ).fetchall()
     groups = {}
     for row in rows:
@@ -49,5 +54,10 @@ def load_missing_jobs(database, city):
         if review is not None:
             job["description_ocr_review_required"] = bool(review)
         job["repair_original_source"] = row["source_file"]
+        for name in LOCATION_COLUMNS:
+            if name in row.keys():
+                job[name] = row[name]
+        if include_locations and not has_detail_location(job):
+            job["location_refresh_required"] = True
         groups.setdefault(row["keyword"], []).append(job)
     return groups
